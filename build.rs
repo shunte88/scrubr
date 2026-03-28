@@ -12,6 +12,7 @@ fn main() {
 
     // Get version from Cargo.toml (set automatically by Cargo)
     let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    let ns = env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "scrubr".to_string());
 
     // Get the current UTC time
     let now = Utc::now();
@@ -32,7 +33,7 @@ fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let svg_path = Path::new(&manifest_dir).join("version.svg");
 
-    let value = format!("LyMonS Version: {} | Built: {}", version, build_date_short);
+    let value = format!("{} Version: {} | Built: {}", ns, version, build_date_short);
 
     // Measure text widths (approximate: 6.4px per char at 11px font)
     let char_width = 6.4_f64;
