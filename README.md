@@ -1,12 +1,10 @@
 # scrubr
 
-The Rust SVG scrubber, AKA scrubr - an SVG optimizer/cleaner, with full **substitution variable support** for dynamic SVG templating systems.
+The Rust SVG scrubber — an SVG optimizer/cleaner with full **substitution variable support** for dynamic SVG templating systems.
 
 ---
 
 ## Features
-
-Scrubr has the following feature set:
 
 | Category | Optimization |
 |---|---|
@@ -16,45 +14,42 @@ Scrubr has the following feature set:
 | **Comments** | Strip `<!-- -->` nodes |
 | **Colors** | Normalize to shortest `#RGB` / `#RRGGBB` hex; convert named colors and `rgb(...)` |
 | **Style** | Convert `style=""` presentation properties to XML attributes |
+| **Embedded CSS** | Optimize `<style>` block content: color simplification, default stripping, ID remapping |
 | **Defaults** | Remove attributes whose value equals the SVG specification default |
 | **IDs** | Strip unreferenced IDs, shorten IDs to minimal length, prefix/list/Inkscape protection |
+| **Gradients** | Deduplicate identical `<linearGradient>`, `<radialGradient>`, `<pattern>` definitions |
 | **Paths** | Optimize `d=""` path data: precision rounding, redundant command removal |
 | **Transforms** | Simplify `matrix(...)` to `translate/scale/rotate`, drop identities |
 | **Numbers** | Apply configurable significant-digit precision to all numeric attributes |
 | **Viewboxing** | Rewrite `width`/`height` to `100%` and add `viewBox` |
+| **Group creation** | Group runs of siblings with identical presentation attributes into `<g>` |
 | **SVGZ** | Read and write gzip-compressed `.svgz` files transparently |
 | **Output** | Configurable indentation (space / tab / none), line-break control |
 
-### Substitution Variable Support (unique to this port)
+### Substitution Variable Support
 
 SVG files used as templates often contain `{{variable}}`, `{{my-var}}`, or `{{my_var}}`
-placeholders that are replaced at render time. This optimizer **fully preserves** those
-tokens throughout every optimization phase:
+placeholders that are replaced at render time. scrubr **fully preserves** those tokens
+throughout every optimization phase:
 
 - Path data containing `{{...}}` is **not modified**
 - Transform values containing `{{...}}` are **not modified**
 - Color values containing `{{...}}` are **not simplified**
-- Attribute values with `{{...}}` have their **ID references still remapped** (normal IDs
-  within the value are updated; the placeholder itself is never altered)
+- `<style>` block rules whose values contain `{{...}}` are **not simplified or stripped**
+- Gradient attribute values containing `{{...}}` make that gradient **unique** (never deduplicated)
+- Attribute values with `{{...}}` have their **normal ID references still remapped** correctly
 - `{{...}}` tokens inside text content, CDATA sections, and comments are preserved verbatim
-
-This means you can freely run scrubr in a build pipeline before template substitution
-without any risk of corrupting your variables.
 
 ---
 
 ## Installation
 
-### From source
-
 ```bash
-git clone <this-repo>
+git clone https://github.com/shunte88/scrubr
 cd scrubr
 cargo build --release
-# Binary at: target/release/scrubr
+# Binary: target/release/scrubr
 ```
-
-### Install globally
 
 ```bash
 cargo install --path .
@@ -68,16 +63,15 @@ cargo install --path .
 scrubr [INPUT.SVG [OUTPUT.SVG]] [OPTIONS]
 ```
 
-If input/output are omitted, stdin/stdout are used. `.svgz` extension triggers
-automatic gzip decompression/compression.
+stdin/stdout used when files are omitted. `.svgz` triggers automatic gzip handling.
 
 ### Quick examples
 
 ```bash
-# Standard optimization
+# Standard
 scrubr -i input.svg -o output.svg
 
-# Better browser compatibility (add viewBox)
+# Browser compatibility
 scrubr -i input.svg -o output.svg --enable-viewboxing
 
 # Maximum scrubbing
@@ -93,9 +87,9 @@ scrubr -i input.svg -o output.svgz \
   --enable-viewboxing --enable-id-stripping \
   --enable-comment-stripping --shorten-ids --indent=none
 
-# Preserve substitution variables (always automatic, no flag needed)
+# Substitution variables are always preserved automatically
 scrubr -i template.svg -o template.min.svg --indent=none
-# {{color}}, {{icon-name}}, {{stroke_width}} are untouched in output
+# {{fill-color}}, {{icon_label}}, {{stroke_width}} → untouched in output
 ```
 
 ---
@@ -109,18 +103,18 @@ scrubr -i template.svg -o template.min.svg --indent=none
 | `-i INPUT.SVG` | Input file (default: stdin) |
 | `-o OUTPUT.SVG` | Output file (default: stdout) |
 | `-q`, `--quiet` | Suppress non-error output |
-| `-v`, `--verbose` | Verbose output (file size statistics) |
+| `-v`, `--verbose` | Verbose output (file size, gradient dedup stats, etc.) |
 
 ### Optimization
 
 | Flag | Default | Description |
 |---|---|---|
 | `--set-precision=NUM` | 5 | Significant digits for numeric values |
-| `--set-c-precision=NUM` | same as above | Significant digits for path control points |
+| `--set-c-precision=NUM` | same | Significant digits for path control points |
 | `--disable-simplify-colors` | off | Don't convert colors to `#RRGGBB` |
 | `--disable-style-to-xml` | off | Don't convert `style=""` to XML attributes |
 | `--disable-group-collapsing` | off | Don't collapse empty `<g>` elements |
-| `--create-groups` | off | Create `<g>` for identical-attribute runs |
+| `--create-groups` | off | Group siblings with identical presentation attrs into `<g>` |
 | `--keep-editor-data` | off | Keep Inkscape/Illustrator/Sketch data |
 | `--keep-unreferenced-defs` | off | Keep unreferenced `<defs>` entries |
 | `--renderer-workaround` | on | Apply librsvg bug workarounds |
@@ -144,8 +138,8 @@ scrubr -i template.svg -o template.min.svg --indent=none
 | Flag | Default | Description |
 |---|---|---|
 | `--indent=TYPE` | `space` | Indentation: `none`, `space`, `tab` |
-| `--nindent=NUM` | `1` | Number of spaces/tabs per indent level |
-| `--no-line-breaks` | off | Output on a single line (also disables indent) |
+| `--nindent=NUM` | `1` | Spaces/tabs per indent level |
+| `--no-line-breaks` | off | Output on a single line |
 | `--strip-xml-space` | off | Remove `xml:space="preserve"` from root `<svg>` |
 
 ### ID Attributes
@@ -167,57 +161,43 @@ scrubr -i template.svg -o template.min.svg --indent=none
 
 ---
 
-## Substitution Variable Reference
-
-Variables matching the pattern `{{word}}`, `{{word-word}}`, or `{{word_word}}`
-(where `word` is alphanumeric with optional `-` or `_`) are protected end-to-end.
-
-**Supported in:**
-- Attribute values: `fill="{{primary-color}}"`, `d="M {{x}} {{y}} L …"`
-- Style values: `style="fill:{{color}};opacity:{{opacity}}"`
-- Text content: `<text>{{label}}</text>`
-- Any combination of the above
-
-**Not treated as substitution variables:**
-- `{{ spaced }}` — spaces inside braces
-- `{{!special}}` — special characters inside braces
-- `{single}` — single braces (passed through unchanged)
-
----
-
 ## Architecture
 
 ```
 src/
-├ main.rs        CLI parsing, I/O, SVGZ handling
-├ optimizer.rs   Core engine: XML parse → analyse → serialize
-│                  Substitution variable protect/restore
-│                  Group collapsing, editor data stripping,
-│                  descriptive element removal, viewboxing,
-│                  ID resolution, namespace handling
-├ css.rs         Style attribute parser, style→XML conversion,
-│                  default value detection
-├ color.rs       Color keyword table, hex normalization, rgb() parsing
-├ path.rs        SVG path `d` attribute optimizer
-├ transform.rs   Transform simplifier (matrix→translate/scale/rotate)
-└ ids.rs         ID shortening, protection logic, rename-map builder
+├── main.rs         CLI parsing, I/O, SVGZ handling
+├── optimizer.rs    Core engine: protect/parse/analyse/serialize/restore
+│                     Gradient dedup integration
+│                     <style> block delegation
+│                     create-groups integration
+│                     Group collapsing, editor stripping, viewboxing
+│                     ID resolution, namespace handling
+├── gradient.rs     Gradient/pattern deduplication
+│                     Canonical key hashing, inheritance resolution
+├── style_block.rs  <style> element CSS optimizer
+│                     Tokeniser, rule parser, color rewrite, ID remapping
+│                     @media/@keyframes pass-through
+├── groups.rs       --create-groups implementation
+│                     Run detection, attribute intersection, <g> wrapping
+├── css.rs          style="" parser, style→XML conversion, default detection
+├── color.rs        Full CSS color keyword table, hex normalization, rgb()
+├── path.rs         SVG path d="" optimizer
+├── transform.rs    Transform simplifier (matrix→translate/scale/rotate)
+└── ids.rs          Short-ID generator, protection logic, rename-map builder
 ```
 
 ---
 
-## Differences from Python scour
+## Comparison with Python scour
 
-| Feature | Python scour | scrubr (Rust) |
+| Feature | Python scour | scrubr |
 |---|---|---|
-| Substitution variables `{{...}}` | Breaks them | **Fully preserved** |
+| Substitution variables `{{...}}` | Corrupts them | **Fully preserved** |
+| Gradient deduplication | ✓ | ✓ |
+| `<style>` block CSS optimization | Basic | ✓ Full (color, defaults, IDs, @media) |
+| `--create-groups` | ✓ | ✓ |
 | Performance | ~seconds on large files | Typically 10–100× faster |
 | SVGZ | ✓ | ✓ |
-| API | Python library | Rust crate (lib usable too) |
-| Gradient deduplication | ✓ | Planned |
-| CSS embedded in `<style>` | Basic | Planned |
-| `--create-groups` | ✓ | Planned (flag accepted, no-op) |
-
-incredible speed and type safety
 
 ---
 
