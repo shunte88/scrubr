@@ -15,12 +15,14 @@ use clap::{Arg, ArgAction, Command};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+//use BUILD_DATE;
 
 use optimizer::{ScourOptions, optimize_svg};
 
 fn main() {
+    let version = env!("CARGO_PKG_VERSION");
     let matches = Command::new("scrubr")
-        .version("1.0.0")
+        .version(version)
         .about("The Rust SVG scrubber — optimizer/cleaner with substitution variable support")
         .arg(Arg::new("input")
             .short('i').long("input").value_name("INPUT.SVG")
@@ -183,6 +185,12 @@ fn main() {
         quiet:                    matches.get_flag("quiet"),
         verbose:                  matches.get_flag("verbose"),
     };
+
+    println!("{} v.{}", 
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"), 
+        //BUILD_DATE
+    );
 
     // Read input
 

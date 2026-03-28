@@ -1,5 +1,8 @@
 # scrubr
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.gnu.org/licenses/apache-2.0)
+![version](version.svg)
+
 The Rust SVG scrubber — an SVG optimizer/cleaner with full **substitution variable support** for dynamic SVG templating systems.
 
 ---

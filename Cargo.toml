@@ -1,7 +1,7 @@
 [package]
 name = "scrubr"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
 description = "The Rust SVG scrubber — optimizer/cleaner with substitution variable support"
 license = "Apache-2.0"
 authors = ["shunte88"]
@@ -13,12 +13,12 @@ path = "src/main.rs"
 [dependencies]
 # XML parsing — zero-copy, safe
 roxmltree = "0.20"
-
-# CLI argument parsing
 clap = { version = "4", features = ["derive"] }
-
-# Gzip for .svgz
 flate2 = "1"
+chrono = "0.4.41"
+
+[build-dependencies]
+chrono = "0.4.41"
 
 [profile.release]
 opt-level = 3
