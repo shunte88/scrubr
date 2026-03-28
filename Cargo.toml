@@ -1,0 +1,27 @@
+[package]
+name = "scrubr"
+version = "1.0.0"
+edition = "2021"
+description = "SVG Optimizer / Cleaner — with subs variable support"
+license = "Apache-2.0"
+authors = ["shunte88"]
+
+[[bin]]
+name = "scrubr"
+path = "src/main.rs"
+
+[dependencies]
+# XML parsing — event-driven, zero-copy, safe
+roxmltree = "0.20"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Gzip compression/decompression for .svgz
+flate2 = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
