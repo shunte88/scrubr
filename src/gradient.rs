@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use crate::subst::CapturedVar;
 
-// ─── Public Types ─────────────────────────────────────────────────────────────
+//  Public Types 
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GradientKey {
@@ -44,7 +44,7 @@ const GRADIENT_DEFINE_ATTRS: &[&str] = &[
     "viewBox", "preserveAspectRatio",
 ];
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+//  Public API 
 
 /// Given gradient definitions extracted from `<defs>`, return a map of
 /// `duplicate_id → canonical_id` for every gradient that is a duplicate.
@@ -76,7 +76,7 @@ pub fn find_duplicate_gradients(
     renames
 }
 
-// ─── Key Construction ─────────────────────────────────────────────────────────
+//  Key Construction 
 
 pub fn make_gradient_key(
     tag: &str,
@@ -106,7 +106,7 @@ pub fn make_stop_key(raw_attrs: &[(String, String)]) -> StopKey {
     StopKey { offset: get("offset"), color, opacity }
 }
 
-// ─── Inheritance Resolution ───────────────────────────────────────────────────
+//  Inheritance Resolution 
 
 fn resolve_inheritance(defs: &[GradientDef]) -> Vec<GradientDef> {
     let by_id: HashMap<&str, &GradientDef> =
@@ -136,7 +136,7 @@ fn resolve_stops<'a>(
     Vec::new()
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+//  Helpers 
 
 fn key_has_placeholder(key: &GradientKey, vars: &[CapturedVar]) -> bool {
     if vars.is_empty() { return false; }

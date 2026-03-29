@@ -30,7 +30,7 @@ use crate::path_simplify::{
     simplify_path_d, combine_path_d, paths_are_combinable,
 };
 
-// ─── Public Types ─────────────────────────────────────────────────────────────
+//  Public Types 
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Indent { None, Space, Tab }
@@ -80,7 +80,7 @@ pub struct OptimizeStats {
     pub empty_defs_removed: usize,
 }
 
-// ─── Entry Point ──────────────────────────────────────────────────────────────
+//  Entry Point 
 
 pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats) {
     let mut stats = OptimizeStats::default();
@@ -186,7 +186,7 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
     (final_output, stats)
 }
 
-// ─── ID / Reference / Gradient Collection ─────────────────────────────────────
+//  ID / Reference / Gradient Collection 
 
 fn collect_ids_and_refs(
     node: Node,
@@ -267,7 +267,7 @@ fn extract_id_refs(val: &str, referenced: &mut HashSet<String>) {
     }
 }
 
-// ─── Editor Namespaces ────────────────────────────────────────────────────────
+//  Editor Namespaces 
 
 const EDITOR_NAMESPACES: &[&str] = &[
     "http://www.inkscape.org/namespaces/inkscape",
@@ -287,7 +287,7 @@ const EDITOR_NAMESPACES: &[&str] = &[
 ];
 fn is_editor_ns(ns: &str) -> bool { EDITOR_NAMESPACES.contains(&ns) }
 
-// ─── Element Serialization ────────────────────────────────────────────────────
+//  Element Serialization 
 
 fn serialize_element(
     node: &Node,
@@ -356,13 +356,13 @@ fn serialize_element(
         return;
     }
 
-    // ── Resolve id ──────────────────────────────────────────────────────
+    //  Resolve id 
     let resolved_id = resolve_id(node, opts, id_map, vars);
 
-    // ── Process style="" ─────────────────────────────────────────────────
+    //  Process style="" 
     let (style_as_xml, remaining_style) = process_style(node, opts, vars);
 
-    // ── Gather and merge attributes ───────────────────────────────────────
+    //  Gather and merge attributes 
     let mut xml_attrs = gather_attrs(node, opts, id_map, vars);
     for (k, v) in &style_as_xml {
         if !xml_attrs.iter().any(|(n, _)| n == k) {
@@ -390,7 +390,7 @@ fn serialize_element(
     xml_attrs.sort_by(|a, b| a.0.cmp(&b.0));
     apply_viewboxing(node, local, opts, &mut xml_attrs, vars);
 
-    // ── Serialize opening tag ─────────────────────────────────────────────
+    //  Serialize opening tag 
     let tag_name = qualified_name(local, ns, node);
     indent(out, opts, depth);
     out.push('<');
@@ -407,7 +407,7 @@ fn serialize_element(
         write_attr(out, "style", s, opts, id_map, vars);
     }
 
-    // ── Children ──────────────────────────────────────────────────────────
+    //  Children 
     let has_visible = node.children().any(|c| match c.node_type() {
         NodeType::Element => {
             if !should_emit_element(&c, opts) { return false; }
@@ -448,7 +448,7 @@ fn serialize_element(
     maybe_newline(out, opts);
 }
 
-// ─── <style> Element ─────────────────────────────────────────────────────────
+//  <style> Element 
 
 fn serialize_style_element(
     node: &Node,
@@ -480,7 +480,7 @@ fn serialize_style_element(
     }
 }
 
-// ─── Child Serialization ─────────────────────────────────────────────────────
+//  Child Serialization 
 
 fn serialize_children(
     node: &Node,
@@ -665,7 +665,7 @@ fn make_indent_unit(opts: &ScourOptions) -> String {
     unit.repeat(opts.nindent as usize)
 }
 
-// ─── Group Collapsing ─────────────────────────────────────────────────────────
+//  Group Collapsing 
 
 fn can_collapse_group(node: &Node, opts: &ScourOptions) -> bool {
     if node.tag_name().name() != "g" { return false; }
@@ -689,7 +689,7 @@ fn can_collapse_group(node: &Node, opts: &ScourOptions) -> bool {
     true
 }
 
-// ─── ID Resolution ────────────────────────────────────────────────────────────
+//  ID Resolution 
 
 fn resolve_id(
     node: &Node,
@@ -711,7 +711,7 @@ fn resolve_id(
     }
 }
 
-// ─── Style Processing ─────────────────────────────────────────────────────────
+//  Style Processing 
 
 fn process_style(
     node: &Node,
@@ -739,7 +739,7 @@ fn process_style(
     (presentation_xml, remaining)
 }
 
-// ─── Attribute Gathering & Optimization ──────────────────────────────────────
+//  Attribute Gathering & Optimization 
 
 const XML_NS:   &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -820,7 +820,7 @@ fn optimize_attr(
     }
 }
 
-// ─── Viewboxing ───────────────────────────────────────────────────────────────
+//  Viewboxing 
 
 fn apply_viewboxing(
     node: &Node,
@@ -848,7 +848,7 @@ fn apply_viewboxing(
     }
 }
 
-// ─── Namespace Helpers ────────────────────────────────────────────────────────
+//  Namespace Helpers 
 
 fn find_ns_prefix(node: &Node, ns_uri: &str) -> Option<String> {
     let mut current = *node;
@@ -903,7 +903,7 @@ fn should_emit_element(node: &Node, opts: &ScourOptions) -> bool {
     }
 }
 
-// ─── ID Reference Remapping ───────────────────────────────────────────────────
+//  ID Reference Remapping 
 
 fn remap_id_refs(val: &str, id_map: &HashMap<String, Option<String>>) -> String {
     if id_map.is_empty() || !val.contains('#') { return val.to_string(); }
@@ -960,7 +960,7 @@ fn remap_href_refs(val: &str, id_map: &HashMap<String, Option<String>>) -> Strin
     out
 }
 
-// ─── Numeric Helpers ──────────────────────────────────────────────────────────
+//  Numeric Helpers 
 
 fn optimize_number(val: &str, precision: u8) -> String {
     let trimmed = val.trim();
@@ -1008,7 +1008,7 @@ fn fmt_f64(v: f64) -> String {
     else { s.to_string() }
 }
 
-// ─── Output Helpers ───────────────────────────────────────────────────────────
+//  Output Helpers 
 
 fn write_attr(
     out: &mut String,

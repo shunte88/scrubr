@@ -43,14 +43,14 @@
 
 use std::collections::HashMap;
 
-// ─── Sentinel ─────────────────────────────────────────────────────────────────
+//  Sentinel 
 
 /// Find the smallest N such that `__SN__` is absent from `text`.
 fn find_sentinel_n(text: &str) -> usize {
     (0usize..).find(|&n| !text.contains(&format!("__S{}__", n))).unwrap()
 }
 
-// ─── Context ──────────────────────────────────────────────────────────────────
+//  Context 
 
 /// The syntactic location of a `{{var}}` token.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,7 +80,7 @@ pub fn neutral_value(ctx: &SubstContext) -> &'static str {
     }
 }
 
-// ─── Attribute name → context ─────────────────────────────────────────────────
+//  Attribute name → context 
 
 const COLOR_ATTRS: &[&str] = &[
     "fill", "stroke", "stop-color", "flood-color", "lighting-color", "color",
@@ -133,7 +133,7 @@ pub fn context_for_css_prop(prop: &str) -> SubstContext {
     }
 }
 
-// ─── Captured variable ────────────────────────────────────────────────────────
+//  Captured variable 
 
 /// One captured `{{...}}` token and its replacement data.
 #[derive(Debug, Clone)]
@@ -146,7 +146,7 @@ pub struct CapturedVar {
     pub neutral: String,
 }
 
-// ─── Forward-scan parser state ────────────────────────────────────────────────
+//  Forward-scan parser state 
 
 #[derive(Debug, Clone)]
 enum ScanState {
@@ -170,7 +170,7 @@ enum ScanState {
     InCdata,
 }
 
-// ─── Main protection pass ─────────────────────────────────────────────────────
+//  Main protection pass 
 
 /// Replace every `{{var}}` in `input` with a context-aware XML-safe placeholder.
 /// Returns `(protected_svg, captured_vars)`.
@@ -187,7 +187,7 @@ pub fn protect_subst_vars(input: &str) -> (String, Vec<CapturedVar>) {
     let mut state = ScanState::Outside;
 
     while i < n {
-        // ── Detect `{{var}}` ──────────────────────────────────────────────
+        //  Detect `{{var}}` 
         if i + 1 < n && chars[i] == '{' && chars[i + 1] == '{' {
             // Scan forward for matching `}}`
             let var_start = i;
@@ -227,7 +227,7 @@ pub fn protect_subst_vars(input: &str) -> (String, Vec<CapturedVar>) {
             }
         }
 
-        // ── Advance parser state ──────────────────────────────────────────
+        //  Advance parser state 
         let ch = chars[i];
         advance_state(&mut state, &chars, &mut i, ch, &mut out);
     }
@@ -394,7 +394,7 @@ fn is_valid_inner(s: &str) -> bool {
         && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
-// ─── Restore ──────────────────────────────────────────────────────────────────
+//  Restore 
 
 /// Replace every `neutral+placeholder` string back to its original `{{token}}`.
 pub fn restore_subst_vars(output: &str, vars: &[CapturedVar]) -> String {
@@ -409,7 +409,7 @@ pub fn restore_subst_vars(output: &str, vars: &[CapturedVar]) -> String {
     result
 }
 
-// ─── Guard helper ─────────────────────────────────────────────────────────────
+//  Guard helper 
 
 /// Return true if `val` contains any placeholder.  Used by optimizer passes to
 /// skip further transformation on values that encode a captured variable.
@@ -418,7 +418,7 @@ pub fn value_has_subst(val: &str, vars: &[CapturedVar]) -> bool {
     vars.iter().any(|cv| val.contains(&cv.placeholder))
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+//  Tests 
 
 #[cfg(test)]
 mod tests {

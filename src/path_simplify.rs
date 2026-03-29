@@ -20,7 +20,7 @@
 
 use crate::subst::{CapturedVar, value_has_subst};
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+//  Public API 
 
 /// Simplify a path `d` string. Safe on subst-placeholder values — the neutral
 /// `M0 0` passes through unchanged.
@@ -47,7 +47,7 @@ pub fn combine_path_d(d1: &str, d2: &str, vars: &[CapturedVar]) -> Option<String
     Some(format!("{} {}", d1, d2))
 }
 
-// ─── Internal command representation (always absolute after conversion) ───────
+//  Internal command representation (always absolute after conversion) 
 
 #[derive(Debug, Clone)]
 enum AbsCmd {
@@ -59,7 +59,7 @@ enum AbsCmd {
     Close,
 }
 
-// ─── Raw tokenized command (before absolutization) ────────────────────────────
+//  Raw tokenized command (before absolutization) 
 
 #[derive(Debug, Clone)]
 struct RawCmd {
@@ -67,7 +67,7 @@ struct RawCmd {
     args: Vec<f64>,
 }
 
-// ─── Parser ───────────────────────────────────────────────────────────────────
+//  Parser 
 
 fn parse_path_d(d: &str) -> Vec<RawCmd> {
     let chars: Vec<char> = d.chars().collect();
@@ -175,7 +175,7 @@ fn read_float(chars: &[char], i: &mut usize) -> Option<f64> {
     chars[start..*i].iter().collect::<String>().parse::<f64>().ok()
 }
 
-// ─── Absolutization + expansion ───────────────────────────────────────────────
+//  Absolutization + expansion 
 
 fn to_absolute(raw: &[RawCmd]) -> Vec<AbsCmd> {
     let mut out = Vec::with_capacity(raw.len());
@@ -278,7 +278,7 @@ fn to_absolute(raw: &[RawCmd]) -> Vec<AbsCmd> {
 
 fn approx_eq(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
 
-// ─── Cleaning passes ──────────────────────────────────────────────────────────
+//  Cleaning passes 
 
 fn clean_commands(cmds: Vec<AbsCmd>) -> Vec<AbsCmd> {
     let after_dedup_m  = remove_consecutive_moves(cmds);
@@ -358,7 +358,7 @@ fn merge_collinear_lines(cmds: Vec<AbsCmd>) -> Vec<AbsCmd> {
     out
 }
 
-// ─── Serialization ────────────────────────────────────────────────────────────
+//  Serialization 
 
 fn serialize_abs(cmds: &[AbsCmd], precision: u8) -> String {
     let mut out = String::new();
@@ -437,7 +437,7 @@ fn round_sig(v: f64, sig: usize) -> f64 {
     (v * factor).round() / factor
 }
 
-// ─── Presentation attribute comparison for path combination ──────────────────
+//  Presentation attribute comparison for path combination 
 
 /// Presentation attributes considered when deciding if two paths can be merged.
 const COMBINE_ATTRS: &[&str] = &[
