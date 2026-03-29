@@ -1,14 +1,10 @@
 /// Core SVG optimizer for scrubr.
 ///
-/// Implements all scour-equivalent optimizations plus the three previously-planned
-/// features now fully operational:
-///   1. Gradient deduplication (`<linearGradient>` / `<radialGradient>` / `<pattern>`)
-///   2. `<style>` block CSS optimization (color simplification, default stripping, ID remaps)
-///   3. `--create-groups`: group sibling elements with identical presentation attributes
-///
-/// Substitution variables (`{{keyword}}`, `{{key-word}}`, `{{key_word}}`) are protected
-/// end-to-end via a null-byte placeholder scheme applied before XML parsing and reversed
-/// after serialization.
+/// Uses the `subst` module for substitution-variable protection:
+///   - Phase 1: Replace {{var}} with XML-safe context-appropriate placeholders
+///   - Phase 2: Parse the now-valid XML
+///   - Phases 3–6: Analyse, deduplicate, rename, serialize
+///   - Phase 7: Restore all {{var}} tokens from the placeholder map
 
 use std::collections::{HashMap, HashSet};
 use roxmltree::{Document, Node, NodeType};
@@ -22,19 +18,19 @@ use crate::path::optimize_path;
 use crate::transform::optimize_transform;
 use crate::ids::build_id_map;
 use crate::gradient::{
-    GradientDef, StopKey, make_gradient_key, make_stop_key, find_duplicate_gradients,
+    GradientDef, make_gradient_key, make_stop_key, find_duplicate_gradients,
 };
 use crate::style_block::optimize_style_block;
 use crate::groups::{ElementFragment, group_runs};
+use crate::subst::{
+    protect_subst_vars, restore_subst_vars,
+    value_has_subst, CapturedVar,
+};
 
-//  Public Types
+//  Public Types 
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Indent {
-    None,
-    Space,
-    Tab,
-}
+pub enum Indent { None, Space, Tab }
 
 #[derive(Debug, Clone)]
 pub struct ScourOptions {
@@ -76,82 +72,19 @@ pub struct OptimizeStats {
     pub gradients_deduplicated: usize,
 }
 
-//  Substitution Variable Protection
-
-const SUBST_PREFIX: &str = "\x00SUBST";
-const SUBST_SUFFIX: &str = "\x00END";
-
-fn protect_subst_vars(input: &str) -> (String, HashMap<String, String>) {
-    let mut var_map: HashMap<String, String> = HashMap::new();
-    let mut result = String::with_capacity(input.len() + 64);
-    let mut counter = 0usize;
-    let chars: Vec<char> = input.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-
-    while i < n {
-        if i + 1 < n && chars[i] == '{' && chars[i + 1] == '{' {
-            let start = i;
-            let mut j = i + 2;
-            let mut found = false;
-            while j + 1 < n {
-                if chars[j] == '}' && chars[j + 1] == '}' {
-                    found = true;
-                    j += 2;
-                    break;
-                }
-                j += 1;
-            }
-            if found {
-                let inner: String = chars[start + 2..j - 2].iter().collect();
-                if is_valid_subst_inner(&inner) {
-                    let original: String = chars[start..j].iter().collect();
-                    let placeholder =
-                        format!("{}{}{}", SUBST_PREFIX, counter, SUBST_SUFFIX);
-                    var_map.insert(placeholder.clone(), original);
-                    result.push_str(&placeholder);
-                    counter += 1;
-                    i = j;
-                    continue;
-                }
-            }
-        }
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    (result, var_map)
-}
-
-fn is_valid_subst_inner(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-}
-
-fn restore_subst_vars(output: &str, var_map: &HashMap<String, String>) -> String {
-    if var_map.is_empty() {
-        return output.to_string();
-    }
-    let mut entries: Vec<(&String, &String)> = var_map.iter().collect();
-    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-    let mut result = output.to_string();
-    for (placeholder, original) in entries {
-        result = result.replace(placeholder.as_str(), original.as_str());
-    }
-    result
-}
-
-//  Entry Point
+//  Entry Point 
 
 pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats) {
     let mut stats = OptimizeStats::default();
 
-    // Phase 1 – protect substitution variables
-    let (protected, var_map) = protect_subst_vars(input);
-    stats.subst_vars_preserved = var_map.len();
+    // Phase 1 – replace {{var}} with XML-safe context-aware placeholders.
+    // The protected string is valid XML; each placeholder embeds a neutral
+    // value appropriate for its attribute type so optimizer passes work
+    // correctly on the synthetic value rather than corrupting it.
+    let (protected, vars) = protect_subst_vars(input);
+    stats.subst_vars_preserved = vars.len();
 
-    // Phase 2 – parse XML
+    // Phase 2 – parse
     let doc = match Document::parse(&protected) {
         Ok(d) => d,
         Err(e) => {
@@ -162,7 +95,7 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
         }
     };
 
-    // Phase 3 – collect IDs, references, gradients, flow-text flag
+    // Phase 3 – collect IDs, references, gradient defs, flowtext flag
     let mut all_ids: Vec<String> = Vec::new();
     let mut referenced_ids: HashSet<String> = HashSet::new();
     let mut has_flowtext = false;
@@ -174,14 +107,15 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
         &mut referenced_ids,
         &mut has_flowtext,
         &mut gradient_defs,
+        &vars,
     );
     stats.has_flowtext = has_flowtext;
 
     // Phase 4 – gradient deduplication
-    let grad_renames = find_duplicate_gradients(&gradient_defs);
+    let grad_renames = find_duplicate_gradients(&gradient_defs, &vars);
     stats.gradients_deduplicated = grad_renames.len();
-    // Merge gradient renames into referenced_ids so duplicates get stripped later
-    for (dup_id, _) in &grad_renames {
+    let grad_dup_ids: HashSet<String> = grad_renames.keys().cloned().collect();
+    for dup_id in &grad_dup_ids {
         referenced_ids.remove(dup_id.as_str());
     }
 
@@ -201,8 +135,6 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
     } else {
         HashMap::new()
     };
-
-    // Insert gradient duplicate renames into the id_map (map dup → canonical)
     for (dup_id, canonical_id) in &grad_renames {
         id_map.insert(dup_id.clone(), Some(canonical_id.clone()));
     }
@@ -220,8 +152,7 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
                     if let Some(pi) = child.pi() {
                         output.push_str(&format!(
                             "<?{} {}?>",
-                            pi.target,
-                            pi.value.unwrap_or("")
+                            pi.target, pi.value.unwrap_or("")
                         ));
                         maybe_newline(&mut output, opts);
                     }
@@ -234,18 +165,20 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
                 }
             }
             NodeType::Element => {
-                serialize_element(&child, &mut output, opts, &id_map, 0);
+                serialize_element(
+                    &child, &mut output, opts, &id_map, &grad_dup_ids, &vars, 0,
+                );
             }
             _ => {}
         }
     }
 
-    // Phase 7 – restore substitution variables
-    let final_output = restore_subst_vars(&output, &var_map);
+    // Phase 7 – restore {{var}} tokens
+    let final_output = restore_subst_vars(&output, &vars);
     (final_output, stats)
 }
 
-//  ID / Reference / Gradient Collection
+//  ID / Reference / Gradient Collection 
 
 fn collect_ids_and_refs(
     node: Node,
@@ -253,72 +186,53 @@ fn collect_ids_and_refs(
     referenced: &mut HashSet<String>,
     has_flowtext: &mut bool,
     gradient_defs: &mut Vec<GradientDef>,
+    vars: &[CapturedVar],
 ) {
     for child in node.children() {
-        if child.node_type() != NodeType::Element {
-            continue;
-        }
+        if child.node_type() != NodeType::Element { continue; }
         let ename = child.tag_name().name();
         if matches!(ename, "flowRoot" | "flowPara" | "flowSpan" | "flowRegion") {
             *has_flowtext = true;
         }
         if let Some(id) = child.attribute("id") {
-            if !id.contains(SUBST_PREFIX) && !id.is_empty() {
+            // Skip IDs that are entirely a placeholder — they'll be restored
+            if !value_has_subst(id, vars) && !id.is_empty() {
                 all_ids.push(id.to_string());
             }
         }
         for attr in child.attributes() {
             extract_id_refs(attr.value(), referenced);
         }
-
-        // Collect gradient definitions (inside <defs>)
-        let parent_is_defs = child
-            .parent()
-            .map(|p| p.tag_name().name() == "defs")
-            .unwrap_or(false);
-        if parent_is_defs
-            && matches!(ename, "linearGradient" | "radialGradient" | "pattern")
-        {
+        let parent_is_defs = child.parent()
+            .map(|p| p.tag_name().name() == "defs").unwrap_or(false);
+        if parent_is_defs && matches!(ename, "linearGradient" | "radialGradient" | "pattern") {
             if let Some(grad) = extract_gradient_def(&child) {
                 gradient_defs.push(grad);
             }
         }
-
-        collect_ids_and_refs(child, all_ids, referenced, has_flowtext, gradient_defs);
+        collect_ids_and_refs(child, all_ids, referenced, has_flowtext, gradient_defs, vars);
     }
 }
 
 fn extract_gradient_def(node: &Node) -> Option<GradientDef> {
     let id = node.attribute("id")?.to_string();
-    if id.contains(SUBST_PREFIX) {
-        return None;
-    }
     let tag = node.tag_name().name().to_string();
-
-    let raw_attrs: Vec<(String, String)> = node
-        .attributes()
+    let raw_attrs: Vec<(String, String)> = node.attributes()
         .filter(|a| a.name() != "id")
         .map(|a| (a.name().to_string(), a.value().to_string()))
         .collect();
-
-    let inherits: Option<String> = raw_attrs
-        .iter()
+    let inherits: Option<String> = raw_attrs.iter()
         .find(|(k, _)| k == "href" || k == "xlink:href")
         .map(|(_, v)| v.trim_start_matches('#').to_string());
-
-    // Collect child <stop> elements
-    let stops: Vec<StopKey> = node
-        .children()
+    let stops = node.children()
         .filter(|c| c.node_type() == NodeType::Element && c.tag_name().name() == "stop")
-        .map(|stop| {
-            let stop_attrs: Vec<(String, String)> = stop
-                .attributes()
+        .map(|s| {
+            let sa: Vec<(String, String)> = s.attributes()
                 .map(|a| (a.name().to_string(), a.value().to_string()))
                 .collect();
-            make_stop_key(&stop_attrs)
+            make_stop_key(&sa)
         })
         .collect();
-
     let key = make_gradient_key(&tag, &raw_attrs, stops);
     Some(GradientDef { id, key, inherits })
 }
@@ -329,33 +243,23 @@ fn extract_id_refs(val: &str, referenced: &mut HashSet<String>) {
         let rest = &s[pos + 5..];
         if let Some(end) = rest.find(')') {
             let id = rest[..end].trim();
-            if !id.is_empty() {
-                referenced.insert(id.to_string());
-            }
+            if !id.is_empty() { referenced.insert(id.to_string()); }
             s = &rest[end + 1..];
-        } else {
-            break;
-        }
+        } else { break; }
     }
     let mut s = val;
     while let Some(pos) = s.find('#') {
         let rest = &s[pos + 1..];
-        let end = rest
-            .find(|c: char| {
-                c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == '.'
-            })
-            .unwrap_or(rest.len());
-        if end > 0 {
-            referenced.insert(rest[..end].to_string());
-        }
-        if end >= rest.len() {
-            break;
-        }
+        let end = rest.find(|c: char| {
+            c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == '.'
+        }).unwrap_or(rest.len());
+        if end > 0 { referenced.insert(rest[..end].to_string()); }
+        if end >= rest.len() { break; }
         s = &rest[end..];
     }
 }
 
-//  Editor Namespace List
+//  Editor Namespaces 
 
 const EDITOR_NAMESPACES: &[&str] = &[
     "http://www.inkscape.org/namespaces/inkscape",
@@ -373,46 +277,35 @@ const EDITOR_NAMESPACES: &[&str] = &[
     "http://ns.adobe.com/pdf/1.3/",
     "http://ns.adobe.com/illustrator/1.0/",
 ];
+fn is_editor_ns(ns: &str) -> bool { EDITOR_NAMESPACES.contains(&ns) }
 
-fn is_editor_ns(ns: &str) -> bool {
-    EDITOR_NAMESPACES.contains(&ns)
-}
-
-//  Element Serialization
+//  Element Serialization 
 
 fn serialize_element(
     node: &Node,
     out: &mut String,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    grad_dup_ids: &HashSet<String>,
+    vars: &[CapturedVar],
     depth: usize,
 ) {
-    let tag = node.tag_name();
+    let tag   = node.tag_name();
     let local = tag.name();
-    let ns = tag.namespace().unwrap_or("");
+    let ns    = tag.namespace().unwrap_or("");
 
-    if !opts.keep_editor_data && !ns.is_empty() && is_editor_ns(ns) {
-        return;
-    }
-
+    if !opts.keep_editor_data && !ns.is_empty() && is_editor_ns(ns) { return; }
     match local {
-        "title" if opts.remove_titles => return,
-        "desc" if opts.remove_descriptions => return,
-        "metadata" if opts.remove_metadata => return,
+        "title"    if opts.remove_titles       => return,
+        "desc"     if opts.remove_descriptions => return,
+        "metadata" if opts.remove_metadata     => return,
         _ => {}
     }
 
-    // Gradient dedup: skip duplicate gradient elements entirely
+    // Suppress deduplicated gradients
     if matches!(local, "linearGradient" | "radialGradient" | "pattern") {
         if let Some(id) = node.attribute("id") {
-            if let Some(Some(_canonical)) = id_map.get(id) {
-                // This ID maps to something else — it was a duplicate gradient, drop it
-                // But only if it's genuinely a gradient rename (not a normal ID shorten)
-                // We detect this by checking if the canonical != id
-                if id_map.get(id).and_then(|v| v.as_deref()) != Some(id) {
-                    return;
-                }
-            }
+            if grad_dup_ids.contains(id) { return; }
         }
     }
 
@@ -421,13 +314,11 @@ fn serialize_element(
         for child in node.children() {
             match child.node_type() {
                 NodeType::Element => {
-                    serialize_element(&child, out, opts, id_map, depth);
+                    serialize_element(&child, out, opts, id_map, grad_dup_ids, vars, depth);
                 }
                 NodeType::Text => {
                     let t = child.text().unwrap_or("");
-                    if !t.trim().is_empty() {
-                        out.push_str(&escape_xml_text(t));
-                    }
+                    if !t.trim().is_empty() { out.push_str(&escape_xml_text(t)); }
                 }
                 NodeType::Comment if !opts.strip_comments => {
                     write_comment(child.text().unwrap_or(""), out);
@@ -438,51 +329,56 @@ fn serialize_element(
         return;
     }
 
-    // Resolve id─
-    let resolved_id = resolve_id(node, opts, id_map);
+    // Resolve id 
+    let resolved_id = resolve_id(node, opts, id_map, vars);
 
-    // Process style=""─
-    let (style_as_xml, remaining_style) = process_style(node, opts);
+    // Process style="" 
+    let (style_as_xml, remaining_style) = process_style(node, opts, vars);
 
-    // Gather attributes─
-    let mut xml_attrs = gather_attrs(node, opts, id_map);
-
-    // Merge presentation attrs from style= (don't override explicit XML attrs)
+    // Gather and merge attributes 
+    let mut xml_attrs = gather_attrs(node, opts, id_map, vars);
     for (k, v) in &style_as_xml {
         if !xml_attrs.iter().any(|(n, _)| n == k) {
             xml_attrs.push((k.clone(), v.clone()));
         }
     }
-
-    xml_attrs.retain(|(k, v)| !is_default_value(k, v));
+    xml_attrs.retain(|(k, v)| {
+        // Never strip an attribute that contains a placeholder
+        value_has_subst(v, vars) || !is_default_value(k, v)
+    });
     xml_attrs.sort_by(|a, b| a.0.cmp(&b.0));
+    apply_viewboxing(node, local, opts, &mut xml_attrs, vars);
 
-    // Viewboxing on root <svg>
-    apply_viewboxing(node, local, opts, &mut xml_attrs);
-
-    // Tag name─
+    // Serialize opening tag 
     let tag_name = qualified_name(local, ns, node);
-
-    // Opening tag─
     indent(out, opts, depth);
     out.push('<');
     out.push_str(&tag_name);
     emit_ns_decls(node, out, opts);
 
-    if let Some(ref id) = resolved_id {
-        write_attr(out, "id", id, opts, id_map);
+    if let Some(id) = &resolved_id {
+        write_attr(out, "id", id, opts, id_map, vars);
     }
     for (k, v) in &xml_attrs {
-        write_attr(out, k, v, opts, id_map);
+        write_attr(out, k, v, opts, id_map, vars);
     }
-    if let Some(ref s) = remaining_style {
-        write_attr(out, "style", s, opts, id_map);
+    if let Some(s) = &remaining_style {
+        write_attr(out, "style", s, opts, id_map, vars);
     }
 
-    // Children─
+    // Children 
     let has_visible = node.children().any(|c| match c.node_type() {
-        NodeType::Element => should_emit_element(&c, opts),
-        NodeType::Text => !c.text().unwrap_or("").trim().is_empty(),
+        NodeType::Element => {
+            if !should_emit_element(&c, opts) { return false; }
+            let cl = c.tag_name().name();
+            if matches!(cl, "linearGradient" | "radialGradient" | "pattern") {
+                if let Some(cid) = c.attribute("id") {
+                    if grad_dup_ids.contains(cid) { return false; }
+                }
+            }
+            true
+        }
+        NodeType::Text    => !c.text().unwrap_or("").trim().is_empty(),
         NodeType::Comment => !opts.strip_comments,
         _ => false,
     });
@@ -496,13 +392,12 @@ fn serialize_element(
     out.push('>');
     maybe_newline(out, opts);
 
-    // Special handling for <style> elements — optimize the CSS block
     if local == "style" {
-        serialize_style_element(node, out, opts, id_map, depth);
+        serialize_style_element(node, out, opts, id_map, vars, depth);
     } else if opts.create_groups {
-        serialize_children_with_grouping(node, out, opts, id_map, depth);
+        serialize_children_with_grouping(node, out, opts, id_map, grad_dup_ids, vars, depth);
     } else {
-        serialize_children(node, out, opts, id_map, depth);
+        serialize_children(node, out, opts, id_map, grad_dup_ids, vars, depth);
     }
 
     indent(out, opts, depth);
@@ -512,16 +407,16 @@ fn serialize_element(
     maybe_newline(out, opts);
 }
 
-//  <style> Element Handler
+//  <style> Element 
 
 fn serialize_style_element(
     node: &Node,
     out: &mut String,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    vars: &[CapturedVar],
     depth: usize,
 ) {
-    // Collect raw text content of the <style> element
     let mut css_text = String::new();
     for child in node.children() {
         match child.node_type() {
@@ -534,41 +429,31 @@ fn serialize_style_element(
             _ => {}
         }
     }
-
-    let optimized_css = optimize_style_block(&css_text, id_map, opts.simplify_colors);
-
-    if !optimized_css.trim().is_empty() {
+    let optimized = optimize_style_block(&css_text, id_map, opts.simplify_colors, vars);
+    if !optimized.trim().is_empty() {
         indent(out, opts, depth + 1);
-        out.push_str(&optimized_css);
+        out.push_str(&optimized);
         maybe_newline(out, opts);
     }
 }
 
-//  Child Serialization (plain)
+//  Child Serialization 
 
 fn serialize_children(
     node: &Node,
     out: &mut String,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    grad_dup_ids: &HashSet<String>,
+    vars: &[CapturedVar],
     depth: usize,
 ) {
     for child in node.children() {
         match child.node_type() {
-            NodeType::Element => serialize_element(&child, out, opts, id_map, depth + 1),
-            NodeType::Text => {
-                let t = child.text().unwrap_or("");
-                let t2 = if opts.no_line_breaks {
-                    collapse_whitespace(t)
-                } else {
-                    t.to_string()
-                };
-                if !t2.trim().is_empty() {
-                    indent(out, opts, depth + 1);
-                    out.push_str(&escape_xml_text(&t2));
-                    maybe_newline(out, opts);
-                }
+            NodeType::Element => {
+                serialize_element(&child, out, opts, id_map, grad_dup_ids, vars, depth + 1);
             }
+            NodeType::Text => emit_text(child.text().unwrap_or(""), out, opts, depth + 1),
             NodeType::Comment => {
                 if !opts.strip_comments {
                     indent(out, opts, depth + 1);
@@ -579,11 +464,7 @@ fn serialize_children(
             NodeType::ProcessingInstruction => {
                 if let Some(pi) = child.pi() {
                     indent(out, opts, depth + 1);
-                    out.push_str(&format!(
-                        "<?{} {}?>",
-                        pi.target,
-                        pi.value.unwrap_or("")
-                    ));
+                    out.push_str(&format!("<?{} {}?>", pi.target, pi.value.unwrap_or("")));
                     maybe_newline(out, opts);
                 }
             }
@@ -592,71 +473,42 @@ fn serialize_children(
     }
 }
 
-//  Child Serialization (with create-groups)─
-
 fn serialize_children_with_grouping(
     node: &Node,
     out: &mut String,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    grad_dup_ids: &HashSet<String>,
+    vars: &[CapturedVar],
     depth: usize,
 ) {
-    // Serialize each child element into a fragment, then apply group_runs
     let mut fragments: Vec<ElementFragment> = Vec::new();
-    let mut non_element_prefix = String::new();
+
+    let flush = |frags: &mut Vec<ElementFragment>, out: &mut String| {
+        if !frags.is_empty() {
+            let unit = make_indent_unit(opts);
+            out.push_str(&group_runs(frags, &unit, depth + 1, opts.no_line_breaks));
+            frags.clear();
+        }
+    };
 
     for child in node.children() {
         match child.node_type() {
             NodeType::Element => {
-                // Flush any accumulated non-element content as a Raw fragment
-                if !non_element_prefix.is_empty() {
-                    out.push_str(&non_element_prefix);
-                    non_element_prefix.clear();
-                }
+                let all_attrs = collect_all_attrs(&child, opts, id_map, vars);
                 let mut frag_text = String::new();
-                let all_attrs = collect_all_attrs(&child, opts, id_map);
-                serialize_element(&child, &mut frag_text, opts, id_map, depth + 1);
-                let frag = ElementFragment::new(
-                    child.tag_name().name(),
-                    frag_text,
-                    &all_attrs,
-                );
-                fragments.push(frag);
+                serialize_element(&child, &mut frag_text, opts, id_map, grad_dup_ids, vars, depth + 1);
+                fragments.push(ElementFragment::new(
+                    child.tag_name().name(), frag_text, &all_attrs, vars,
+                ));
             }
             NodeType::Text => {
-                // Flush fragments first, then emit text
-                if !fragments.is_empty() {
-                    let indent_unit = make_indent_unit(opts);
-                    let grouped =
-                        group_runs(&fragments, &indent_unit, depth + 1, opts.no_line_breaks);
-                    out.push_str(&grouped);
-                    fragments.clear();
-                }
-                let t = child.text().unwrap_or("");
-                let t2 = if opts.no_line_breaks {
-                    collapse_whitespace(t)
-                } else {
-                    t.to_string()
-                };
-                if !t2.trim().is_empty() {
-                    indent(out, opts, depth + 1);
-                    out.push_str(&escape_xml_text(&t2));
-                    maybe_newline(out, opts);
-                }
+                flush(&mut fragments, out);
+                emit_text(child.text().unwrap_or(""), out, opts, depth + 1);
             }
             NodeType::Comment => {
                 if !opts.strip_comments {
-                    if !fragments.is_empty() {
-                        let indent_unit = make_indent_unit(opts);
-                        let grouped = group_runs(
-                            &fragments,
-                            &indent_unit,
-                            depth + 1,
-                            opts.no_line_breaks,
-                        );
-                        out.push_str(&grouped);
-                        fragments.clear();
-                    }
+                    flush(&mut fragments, out);
                     indent(out, opts, depth + 1);
                     write_comment(child.text().unwrap_or(""), out);
                     maybe_newline(out, opts);
@@ -665,64 +517,39 @@ fn serialize_children_with_grouping(
             _ => {}
         }
     }
-
-    // Flush remaining fragments
-    if !fragments.is_empty() {
-        let indent_unit = make_indent_unit(opts);
-        let grouped =
-            group_runs(&fragments, &indent_unit, depth + 1, opts.no_line_breaks);
-        out.push_str(&grouped);
-    }
+    flush(&mut fragments, out);
 }
 
-/// Collect all non-id, non-style attributes plus style-derived presentation attrs
-/// for a node, as flat (name, value) pairs — used to determine groupability.
 fn collect_all_attrs(
     node: &Node,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    vars: &[CapturedVar],
 ) -> Vec<(String, String)> {
-    let mut attrs: Vec<(String, String)> = gather_attrs(node, opts, id_map);
-    let (style_xml, _) = process_style(node, opts);
+    let mut attrs = gather_attrs(node, opts, id_map, vars);
+    let (style_xml, _) = process_style(node, opts, vars);
     for (k, v) in style_xml {
-        if !attrs.iter().any(|(n, _)| n == &k) {
-            attrs.push((k, v));
-        }
+        if !attrs.iter().any(|(n, _)| n == &k) { attrs.push((k, v)); }
     }
     attrs
 }
 
 fn make_indent_unit(opts: &ScourOptions) -> String {
-    if opts.no_line_breaks || opts.indent == Indent::None {
-        return String::new();
-    }
-    let unit = match opts.indent {
-        Indent::Tab => "\t",
-        _ => " ",
-    };
+    if opts.no_line_breaks || opts.indent == Indent::None { return String::new(); }
+    let unit = match opts.indent { Indent::Tab => "\t", _ => " " };
     unit.repeat(opts.nindent as usize)
 }
 
-//  Group Collapsing─
+//  Group Collapsing 
 
 fn can_collapse_group(node: &Node, opts: &ScourOptions) -> bool {
-    if node.tag_name().name() != "g" {
-        return false;
-    }
-    if node.attribute("id").is_some() {
-        return false;
-    }
-    if node.attribute("class").is_some() {
-        return false;
-    }
-    if node.attribute("transform").is_some() {
-        return false;
-    }
+    if node.tag_name().name() != "g" { return false; }
+    if node.attribute("id").is_some() { return false; }
+    if node.attribute("class").is_some() { return false; }
+    if node.attribute("transform").is_some() { return false; }
     if let Some(style) = node.attribute("style") {
         let decls = parse_style(style);
-        if decls.iter().any(|(k, v)| !is_default_value(k, v)) {
-            return false;
-        }
+        if decls.iter().any(|(k, v)| !is_default_value(k, v)) { return false; }
     }
     let has_meaningful = node.attributes().any(|a| {
         let n = a.name();
@@ -730,30 +557,24 @@ fn can_collapse_group(node: &Node, opts: &ScourOptions) -> bool {
         !matches!(n, "id" | "style" | "class")
             && (ns.is_empty() || (!opts.keep_editor_data && !is_editor_ns(ns)))
     });
-    if has_meaningful {
-        return false;
-    }
-    if node
-        .parent()
-        .map(|p| p.tag_name().name() == "defs")
-        .unwrap_or(false)
-    {
+    if has_meaningful { return false; }
+    if node.parent().map(|p| p.tag_name().name() == "defs").unwrap_or(false) {
         return false;
     }
     true
 }
 
-//  ID Resolution─
+//  ID Resolution 
 
 fn resolve_id(
     node: &Node,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    vars: &[CapturedVar],
 ) -> Option<String> {
     let raw = node.attribute("id")?;
-    if raw.contains(SUBST_PREFIX) {
-        return Some(raw.to_string());
-    }
+    // If the id value contains a placeholder, preserve it verbatim
+    if value_has_subst(raw, vars) { return Some(raw.to_string()); }
     if opts.strip_ids || opts.shorten_ids {
         match id_map.get(raw) {
             Some(Some(new_id)) => Some(new_id.clone()),
@@ -765,11 +586,12 @@ fn resolve_id(
     }
 }
 
-//  Style Processing─
+//  Style Processing 
 
 fn process_style(
     node: &Node,
     opts: &ScourOptions,
+    vars: &[CapturedVar],
 ) -> (Vec<(String, String)>, Option<String>) {
     let style_val = match node.attribute("style") {
         Some(s) if !s.trim().is_empty() => s,
@@ -777,53 +599,53 @@ fn process_style(
     };
     let mut decls = parse_style(style_val);
     simplify_style_colors(&mut decls, opts.simplify_colors);
+
     let presentation_xml: Vec<(String, String)> = if opts.style_to_xml {
         extract_presentation_attrs(&mut decls)
             .into_iter()
-            .filter(|(k, v)| !is_default_value(k, v))
+            .filter(|(k, v)| value_has_subst(v, vars) || !is_default_value(k, v))
             .collect()
     } else {
         Vec::new()
     };
-    decls.retain(|(k, v)| !is_default_value(k, v));
-    let remaining = if decls.is_empty() {
-        None
-    } else {
-        Some(serialize_style(&decls))
-    };
+
+    decls.retain(|(k, v)| value_has_subst(v, vars) || !is_default_value(k, v));
+    let remaining = if decls.is_empty() { None } else { Some(serialize_style(&decls)) };
     (presentation_xml, remaining)
 }
 
-//  Attribute Gathering─
+//  Attribute Gathering & Optimization 
 
-const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+const XML_NS:   &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
 fn gather_attrs(
     node: &Node,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    vars: &[CapturedVar],
 ) -> Vec<(String, String)> {
     let local_name = node.tag_name().name();
     let mut attrs: Vec<(String, String)> = Vec::new();
     for attr in node.attributes() {
         let aname = attr.name();
-        let ans = attr.namespace().unwrap_or("");
+        let ans   = attr.namespace().unwrap_or("");
         if aname == "id" && ans.is_empty() { continue; }
         if aname == "style" && ans.is_empty() { continue; }
         if ans == XMLNS_NS || aname == "xmlns" || aname.starts_with("xmlns:") { continue; }
         if !opts.keep_editor_data && !ans.is_empty() && is_editor_ns(ans) { continue; }
         if aname == "space" && ans == XML_NS && opts.strip_xml_space { continue; }
+
         let val = attr.value();
-        let qname: String = if ans.is_empty() {
+        let qname = if ans.is_empty() {
             aname.to_string()
         } else {
             match find_ns_prefix(node, ans) {
-                Some(ref pfx) if !pfx.is_empty() => format!("{}:{}", pfx, aname),
+                Some(p) if !p.is_empty() => format!("{}:{}", p, aname),
                 _ => aname.to_string(),
             }
         };
-        let optimized = optimize_attr(aname, val, local_name, opts, id_map);
+        let optimized = optimize_attr(aname, val, local_name, opts, id_map, vars);
         attrs.push((qname, optimized));
     }
     attrs
@@ -835,11 +657,19 @@ fn optimize_attr(
     element: &str,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    vars: &[CapturedVar],
 ) -> String {
+    // Always remap ID references first (works on placeholders too — only the
+    // embedded normal-ID portions are remapped, placeholders are inert strings)
     let remapped = remap_id_refs(val, id_map);
-    if remapped.contains(SUBST_PREFIX) {
+
+    // If the value (after ID remapping) still contains a placeholder,
+    // don't apply any further transformation — the placeholder encodes
+    // a neutral value but we must preserve it for restoration.
+    if value_has_subst(&remapped, vars) {
         return remapped;
     }
+
     match name {
         "d" if element == "path" => optimize_path(&remapped, opts.precision, opts.c_precision),
         "transform" | "patternTransform" | "gradientTransform" => {
@@ -848,30 +678,31 @@ fn optimize_attr(
         "fill" | "stroke" | "stop-color" | "flood-color" | "lighting-color" | "color"
             if opts.simplify_colors => simplify_color(&remapped),
         "x" | "y" | "x1" | "y1" | "x2" | "y2"
-        | "cx" | "cy" | "r" | "rx" | "ry"
-        | "fx" | "fy" | "offset"
+        | "cx" | "cy" | "r" | "rx" | "ry" | "fx" | "fy" | "offset"
         | "stroke-width" | "stroke-miterlimit" | "stroke-dashoffset"
         | "font-size" | "letter-spacing" | "word-spacing" | "kerning"
-        | "opacity" | "fill-opacity" | "stroke-opacity" | "stop-opacity"
-        | "flood-opacity" | "k" | "k1" | "k2" | "k3" | "k4"
+        | "opacity" | "fill-opacity" | "stroke-opacity" | "stop-opacity" | "flood-opacity"
+        | "k" | "k1" | "k2" | "k3" | "k4"
         | "amplitude" | "exponent" | "intercept" | "slope"
         | "specularConstant" | "specularExponent" | "diffuseConstant"
         | "surfaceScale" | "seed" | "numOctaves" => optimize_number(&remapped, opts.precision),
         "width" | "height" if element != "svg" => optimize_number(&remapped, opts.precision),
         "viewBox" | "points" | "stdDeviation" | "baseFrequency"
-        | "kernelMatrix" | "tableValues" | "values" | "keyTimes"
-        | "keySplines" | "order" => optimize_number_list(&remapped, opts.precision),
+        | "kernelMatrix" | "tableValues" | "values" | "keyTimes" | "keySplines" | "order" => {
+            optimize_number_list(&remapped, opts.precision)
+        }
         _ => remapped,
     }
 }
 
-//  Viewboxing─
+//  Viewboxing 
 
 fn apply_viewboxing(
     node: &Node,
     local: &str,
     opts: &ScourOptions,
     xml_attrs: &mut Vec<(String, String)>,
+    vars: &[CapturedVar],
 ) {
     if !opts.enable_viewboxing || local != "svg" || node.attribute("viewBox").is_some() {
         return;
@@ -879,10 +710,12 @@ fn apply_viewboxing(
     let w = node.attribute("width");
     let h = node.attribute("height");
     if let (Some(w), Some(h)) = (w, h) {
+        // Don't viewbox if width/height contain placeholders
+        if value_has_subst(w, vars) || value_has_subst(h, vars) { return; }
         if let (Some(wv), Some(hv)) = (strip_units(w), strip_units(h)) {
             let viewbox = format!("0 0 {} {}", wv, hv);
             for a in xml_attrs.iter_mut() {
-                if a.0 == "width" { a.1 = "100%".to_string(); }
+                if a.0 == "width"  { a.1 = "100%".to_string(); }
                 if a.0 == "height" { a.1 = "100%".to_string(); }
             }
             xml_attrs.push(("viewBox".to_string(), viewbox));
@@ -890,7 +723,7 @@ fn apply_viewboxing(
     }
 }
 
-//  Namespace Utilities─
+//  Namespace Helpers 
 
 fn find_ns_prefix(node: &Node, ns_uri: &str) -> Option<String> {
     let mut current = *node;
@@ -904,18 +737,13 @@ fn find_ns_prefix(node: &Node, ns_uri: &str) -> Option<String> {
                 }
             }
         }
-        match current.parent() {
-            Some(p) => current = p,
-            None => break,
-        }
+        match current.parent() { Some(p) => current = p, None => break }
     }
     None
 }
 
 fn qualified_name(local: &str, ns: &str, node: &Node) -> String {
-    if ns.is_empty() || ns == "http://www.w3.org/2000/svg" {
-        return local.to_string();
-    }
+    if ns.is_empty() || ns == "http://www.w3.org/2000/svg" { return local.to_string(); }
     match find_ns_prefix(node, ns) {
         Some(pfx) if !pfx.is_empty() => format!("{}:{}", pfx, local),
         _ => local.to_string(),
@@ -924,7 +752,7 @@ fn qualified_name(local: &str, ns: &str, node: &Node) -> String {
 
 fn emit_ns_decls(node: &Node, out: &mut String, opts: &ScourOptions) {
     for attr in node.attributes() {
-        let aname = attr.name();
+        let aname   = attr.name();
         let attr_ns = attr.namespace().unwrap_or("");
         let is_xmlns = attr_ns == XMLNS_NS || aname == "xmlns" || aname.starts_with("xmlns:");
         if !is_xmlns { continue; }
@@ -940,22 +768,22 @@ fn emit_ns_decls(node: &Node, out: &mut String, opts: &ScourOptions) {
 
 fn should_emit_element(node: &Node, opts: &ScourOptions) -> bool {
     let local = node.tag_name().name();
-    let ns = node.tag_name().namespace().unwrap_or("");
+    let ns    = node.tag_name().namespace().unwrap_or("");
     if !opts.keep_editor_data && !ns.is_empty() && is_editor_ns(ns) { return false; }
     match local {
-        "title" if opts.remove_titles => false,
-        "desc" if opts.remove_descriptions => false,
-        "metadata" if opts.remove_metadata => false,
+        "title"    if opts.remove_titles       => false,
+        "desc"     if opts.remove_descriptions => false,
+        "metadata" if opts.remove_metadata     => false,
         _ => true,
     }
 }
 
-//  ID Reference Remapping─
+//  ID Reference Remapping 
 
 fn remap_id_refs(val: &str, id_map: &HashMap<String, Option<String>>) -> String {
     if id_map.is_empty() || !val.contains('#') { return val.to_string(); }
-    let stage1 = remap_url_refs(val, id_map);
-    remap_href_refs(&stage1, id_map)
+    let s1 = remap_url_refs(val, id_map);
+    remap_href_refs(&s1, id_map)
 }
 
 fn remap_url_refs(val: &str, id_map: &HashMap<String, Option<String>>) -> String {
@@ -990,42 +818,35 @@ fn remap_href_refs(val: &str, id_map: &HashMap<String, Option<String>>) -> Strin
     while i < n {
         if i + 2 < n
             && chars[i] == '='
-            && (chars[i + 1] == '"' || chars[i + 1] == '\'')
-            && chars[i + 2] == '#'
+            && (chars[i+1] == '"' || chars[i+1] == '\'')
+            && chars[i+2] == '#'
         {
-            let quote = chars[i + 1];
-            out.push('=');
-            out.push(quote);
-            out.push('#');
+            let q = chars[i+1];
+            out.push('='); out.push(q); out.push('#');
             i += 3;
             let mut id = String::new();
-            while i < n && chars[i] != quote { id.push(chars[i]); i += 1; }
+            while i < n && chars[i] != q { id.push(chars[i]); i += 1; }
             match id_map.get(id.as_str()) {
                 Some(Some(new_id)) => out.push_str(new_id),
                 _ => out.push_str(&id),
             }
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
+        } else { out.push(chars[i]); i += 1; }
     }
     out
 }
 
-//  Numeric Helpers
+//  Numeric Helpers 
 
 fn optimize_number(val: &str, precision: u8) -> String {
-    if val.contains(SUBST_PREFIX) || val.contains("{{") { return val.to_string(); }
     let trimmed = val.trim();
-    let (num_part, unit) = split_number_unit(trimmed);
-    match num_part.parse::<f64>() {
+    let (num, unit) = split_number_unit(trimmed);
+    match num.parse::<f64>() {
         Ok(n) => format!("{}{}", fmt_f64(round_to_sig(n, precision as usize)), unit),
         Err(_) => val.to_string(),
     }
 }
 
 fn optimize_number_list(val: &str, precision: u8) -> String {
-    if val.contains(SUBST_PREFIX) || val.contains("{{") { return val.to_string(); }
     let sep = if val.contains(',') { "," } else { " " };
     val.split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
@@ -1035,10 +856,10 @@ fn optimize_number_list(val: &str, precision: u8) -> String {
 }
 
 fn split_number_unit(s: &str) -> (&str, &str) {
-    const UNITS: &[&str] = &["px", "pt", "pc", "mm", "cm", "in", "em", "ex", "%"];
+    const UNITS: &[&str] = &["px","pt","pc","mm","cm","in","em","ex","%"];
     for u in UNITS {
         if s.ends_with(u) {
-            let num = &s[..s.len() - u.len()];
+            let num = &s[..s.len()-u.len()];
             if num.parse::<f64>().is_ok() { return (num, u); }
         }
     }
@@ -1047,20 +868,22 @@ fn split_number_unit(s: &str) -> (&str, &str) {
 
 pub fn round_to_sig(v: f64, sig: usize) -> f64 {
     if v == 0.0 || sig == 0 { return 0.0; }
-    let magnitude = v.abs().log10().floor() as i32;
-    let factor = 10f64.powi(sig as i32 - 1 - magnitude);
+    let mag = v.abs().log10().floor() as i32;
+    let factor = 10f64.powi(sig as i32 - 1 - mag);
     (v * factor).round() / factor
 }
 
 fn fmt_f64(v: f64) -> String {
+    if v.is_nan() || v.is_infinite() { return "0".to_string(); }
     if v.fract() == 0.0 && v.abs() < 1e15 { return format!("{}", v as i64); }
     let s = format!("{:.10}", v);
-    let s = s.trim_end_matches('0');
-    let s = s.trim_end_matches('.');
-    s.to_string()
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if let Some(r) = s.strip_prefix("-0.") { format!("-.{}", r) }
+    else if let Some(r) = s.strip_prefix("0.") { format!(".{}", r) }
+    else { s.to_string() }
 }
 
-//  Output Helpers
+//  Output Helpers 
 
 fn write_attr(
     out: &mut String,
@@ -1068,23 +891,33 @@ fn write_attr(
     val: &str,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    _vars: &[CapturedVar],
 ) {
-    let final_val = if (opts.strip_ids || opts.shorten_ids) && val.contains('#') {
+    let v = if (opts.strip_ids || opts.shorten_ids) && val.contains('#') {
         remap_id_refs(val, id_map)
     } else {
         val.to_string()
     };
+    // Don't escape inside placeholders — but since placeholders use only
+    // alphanumeric + `_`, escape_xml_attr is safe to run over the whole string.
     out.push(' ');
     out.push_str(name);
     out.push_str("=\"");
-    out.push_str(&escape_xml_attr(&final_val));
+    out.push_str(&escape_xml_attr(&v));
     out.push('"');
 }
 
+fn emit_text(text: &str, out: &mut String, opts: &ScourOptions, depth: usize) {
+    let t = if opts.no_line_breaks { collapse_ws(text) } else { text.to_string() };
+    if !t.trim().is_empty() {
+        indent(out, opts, depth);
+        out.push_str(&escape_xml_text(&t));
+        maybe_newline(out, opts);
+    }
+}
+
 fn write_comment(text: &str, out: &mut String) {
-    out.push_str("<!--");
-    out.push_str(text);
-    out.push_str("-->");
+    out.push_str("<!--"); out.push_str(text); out.push_str("-->");
 }
 
 fn maybe_newline(out: &mut String, opts: &ScourOptions) {
@@ -1094,34 +927,29 @@ fn maybe_newline(out: &mut String, opts: &ScourOptions) {
 fn indent(out: &mut String, opts: &ScourOptions, depth: usize) {
     if opts.no_line_breaks || opts.indent == Indent::None || depth == 0 { return; }
     let unit = match opts.indent { Indent::Tab => "\t", _ => " " };
-    let count = depth * opts.nindent as usize;
-    for _ in 0..count { out.push_str(unit); }
+    for _ in 0..depth * opts.nindent as usize { out.push_str(unit); }
 }
 
 fn escape_xml_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    s.replace('&', "&amp;").replace('<', "&lt;")
+     .replace('>', "&gt;").replace('"', "&quot;")
 }
 
 fn escape_xml_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn collapse_whitespace(s: &str) -> String {
+fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn strip_units(val: &str) -> Option<String> {
-    const UNITS: &[&str] = &["px", "pt", "pc", "mm", "cm", "in", "em", "ex"];
+    const UNITS: &[&str] = &["px","pt","pc","mm","cm","in","em","ex"];
     let mut v = val.trim();
     for u in UNITS {
         if v.ends_with(u) {
-            let candidate = &v[..v.len() - u.len()];
-            if candidate.parse::<f64>().is_ok() { v = candidate; break; }
+            let c = &v[..v.len()-u.len()];
+            if c.parse::<f64>().is_ok() { v = c; break; }
         }
     }
     if v.parse::<f64>().is_ok() { Some(v.to_string()) } else { None }

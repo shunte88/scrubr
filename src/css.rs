@@ -147,7 +147,6 @@ pub fn extract_presentation_attrs(
 /// Default values for presentation attributes — don't emit if value equals default.
 pub fn is_default_value(prop: &str, val: &str) -> bool {
     // Don't strip defaults that contain substitution variables
-    if val.contains("{{") { return false; }
     match prop {
         "fill"             => val == "black" || val == "#000" || val == "#000000",
         "fill-opacity"     => val == "1",

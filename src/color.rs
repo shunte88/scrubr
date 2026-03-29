@@ -171,11 +171,6 @@ pub fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
 pub fn simplify_color(value: &str) -> String {
     let v = value.trim();
 
-    // Never touch substitution variables
-    if v.contains("{{") {
-        return v.to_string();
-    }
-
     // Already a short hex - normalize case
     if let Some(hex) = try_parse_hex(v) {
         return hex;

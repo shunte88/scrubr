@@ -10,15 +10,17 @@ authors = ["shunte88"]
 name = "scrubr"
 path = "src/main.rs"
 
-[dependencies]
-# XML parsing — zero-copy, safe
-roxmltree = "0.20"
-clap = { version = "4", features = ["derive"] }
-flate2 = "1"
-chrono = "0.4.41"
-
 [build-dependencies]
 chrono = "0.4.41"
+
+[dependencies]
+chrono = { version = "0.4.41" }
+# XML parsing — zero-copy, safe
+roxmltree = "0.20"
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+# Gzip for .svgz
+flate2 = "1"
 
 [profile.release]
 opt-level = 3

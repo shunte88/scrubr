@@ -1,19 +1,22 @@
-/// ID management utilities for the SVG optimizer.
-/// IDs that appear inside substitution variables ({{id}}) are never touched.
+/// ID management — shortening, stripping, and protection logic.
 
 use std::collections::{HashMap, HashSet};
 
-/// Generate a shortened ID from a counter. Uses base-52 (a-z, A-Z) then extends.
+//  ID Generation 
+
+/// Generate the n-th short ID in the sequence a, b, …, z, A, B, …, Z, aa, ab, …
+/// An optional prefix is prepended.
 pub fn short_id(n: usize, prefix: Option<&str>) -> String {
-    let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect();
-    let base = alphabet.len();
+    const ALPHA: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let base = ALPHA.len();
     let mut result = Vec::new();
     let mut n = n;
     loop {
-        result.push(alphabet[n % base]);
+        result.push(ALPHA[n % base] as char);
         n /= base;
         if n == 0 { break; }
-        n -= 1;
+        n -= 1; // convert from zero-indexed base to "no zero digit" base
     }
     result.reverse();
     let s: String = result.into_iter().collect();
@@ -23,46 +26,42 @@ pub fn short_id(n: usize, prefix: Option<&str>) -> String {
     }
 }
 
-/// Check whether an ID should be protected based on options
-pub fn should_protect_id(
+//  Protection Check 
+
+/// Return true if this ID should never be removed or renamed.
+fn should_protect(
     id: &str,
     protect_noninkscape: bool,
-    protect_list: &[String],
+    protect_list: &HashSet<String>,
     protect_prefix: Option<&str>,
 ) -> bool {
-    // Protect IDs within substitution variables (handled at a higher level,
-    // but also guard here)
-    if id.contains("{{") || id.contains("}}") {
+    if protect_list.contains(id) {
         return true;
     }
-
-    // Protect if in explicit list
-    if protect_list.iter().any(|p| p == id) {
-        return true;
-    }
-
-    // Protect if matching prefix
     if let Some(pfx) = protect_prefix {
         if id.starts_with(pfx) {
             return true;
         }
     }
-
-    // Protect IDs not ending in a digit (Inkscape convention flag)
+    // Inkscape convention: IDs not ending in a digit are "semantic" names
     if protect_noninkscape {
         if !id.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
             return true;
         }
     }
-
     false
 }
 
-/// Build a rename map for all IDs that should be shortened.
-/// `ids_in_use` = all IDs defined in the SVG.
-/// `referenced_ids` = IDs that are actually referenced (url(#...), xlink:href, etc.)
+//  Build Rename Map 
+
+/// Build a map from every defined ID to its new value:
+///   - `Some(same_id)` — keep as-is
+///   - `Some(new_id)`  — rename to new_id
+///   - `None`          — remove (strip)
+///
+/// Returns `(map, count_removed)`.
 pub fn build_id_map(
-    ids_in_use: &[String],
+    all_ids: &[String],
     referenced_ids: &HashSet<String>,
     strip_unreferenced: bool,
     shorten: bool,
@@ -71,16 +70,25 @@ pub fn build_id_map(
     protect_list: &[String],
     protect_prefix: Option<&str>,
 ) -> (HashMap<String, Option<String>>, usize) {
-    // Returns: map of old_id -> Some(new_id) | None (= remove)
-    // Also returns count of IDs removed
+    // Build a fast-lookup set of protect_list
+    let protect_set: HashSet<String> = protect_list.iter().cloned().collect();
+
+    // Set of all currently-defined IDs for collision avoidance
+    let existing: HashSet<&str> = all_ids.iter().map(|s| s.as_str()).collect();
 
     let mut map: HashMap<String, Option<String>> = HashMap::new();
     let mut counter = 0usize;
     let mut removed = 0usize;
 
-    for id in ids_in_use {
-        if should_protect_id(id, protect_noninkscape, protect_list, protect_prefix) {
-            // Keep as-is
+    for id in all_ids {
+        let protected = should_protect(
+            id,
+            protect_noninkscape,
+            &protect_set,
+            protect_prefix,
+        );
+
+        if protected {
             map.insert(id.clone(), Some(id.clone()));
             continue;
         }
@@ -94,16 +102,17 @@ pub fn build_id_map(
         }
 
         if shorten {
+            // Find next short ID not already used in the document
             let new_id = loop {
                 let candidate = short_id(counter, shorten_prefix);
                 counter += 1;
-                // Ensure not colliding with existing IDs
-                if !ids_in_use.contains(&candidate) {
+                if !existing.contains(candidate.as_str()) {
                     break candidate;
                 }
             };
             map.insert(id.clone(), Some(new_id));
         } else {
+            // No shortening — keep as-is
             map.insert(id.clone(), Some(id.clone()));
         }
     }

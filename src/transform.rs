@@ -4,10 +4,6 @@
 /// Optimize a transform attribute value.
 /// Returns original string if it contains substitution variables.
 pub fn optimize_transform(t: &str, precision: u8) -> String {
-    if t.contains("{{") {
-        return t.to_string();
-    }
-
     let t = t.trim();
     if t.is_empty() || t == "none" {
         return t.to_string();
@@ -66,6 +62,7 @@ fn round_to_prec(v: f64, prec: u8) -> f64 {
 
 fn fmt(v: f64, prec: u8) -> String {
     let r = round_to_prec(v, prec);
+    if r.is_nan() || r.is_infinite() { return "0".to_string(); }
     if r == r.floor() && r.abs() < 1e15 {
         format!("{}", r as i64)
     } else {

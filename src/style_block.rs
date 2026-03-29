@@ -1,84 +1,54 @@
 /// Optimizer for SVG `<style>` element content.
 ///
-/// Handles:
-///   - Color simplification in property values
-///   - Default value removal from rules
-///   - ID reference remapping (`#old-id` → `#new-id`) in selectors and values
-///   - Whitespace normalisation and rule deduplication
-///   - Preservation of substitution variable placeholders
-///
-/// Deliberately conservative: only rewrites property values it understands.
-/// At-rules (`@font-face`, `@keyframes`, `@media`) are passed through with
-/// only colour/ID rewrites applied — their structure is never altered.
+/// Handles color simplification, default removal, ID remapping, and whitespace
+/// normalisation. Values containing substitution variable placeholders are
+/// detected via the `subst::value_has_subst` guard and left untouched.
 
 use std::collections::HashMap;
 use crate::color::simplify_color;
 use crate::css::is_default_value;
+use crate::subst::CapturedVar;
 
-const SUBST_PLACEHOLDER_MARKER: &str = "\x00SUBST";
+//  Public API 
 
-//  Public API─
-
-/// Optimise an entire CSS text block (the content of a `<style>` element).
-///
-/// `id_map`: optional rename map built by the ID optimisation pass.
-/// `simplify_colors`: whether to normalise colour values.
 pub fn optimize_style_block(
     css: &str,
     id_map: &HashMap<String, Option<String>>,
     simplify_colors: bool,
+    vars: &[CapturedVar],
 ) -> String {
-    // Never process style blocks that contain substitution variable placeholders
-    // at the top level — the tokeniser could corrupt them.  Individual rule
-    // values are guarded inside the deeper functions.
     let tokens = tokenize_css(css);
     let mut out = String::with_capacity(css.len());
 
-    let mut i = 0;
-    while i < tokens.len() {
-        match &tokens[i] {
-            CssToken::AtRule(at_kw, block) => {
-                // Rewrite colour / id refs inside at-rule blocks conservatively
-                let rewritten = rewrite_at_rule_block(at_kw, block, id_map, simplify_colors);
-                out.push_str(&rewritten);
-                i += 1;
+    for tok in &tokens {
+        match tok {
+            CssToken::AtRule(kw, block) => {
+                out.push_str(&rewrite_at_rule(kw, block, id_map, simplify_colors, vars));
             }
-            CssToken::Rule(selector, declarations) => {
-                let new_sel = rewrite_selector(selector, id_map);
-                let new_decls = optimize_declarations(declarations, simplify_colors);
+            CssToken::Rule(selector, decls) => {
+                let new_sel = rewrite_selector(selector, id_map, vars);
+                let new_decls = optimize_declarations(decls, simplify_colors, vars);
                 if !new_decls.trim().is_empty() {
                     out.push_str(&new_sel);
                     out.push('{');
                     out.push_str(&new_decls);
                     out.push('}');
                 }
-                i += 1;
             }
-            CssToken::Comment(c) => {
-                out.push_str(c);
-                i += 1;
-            }
-            CssToken::Raw(r) => {
-                out.push_str(r);
-                i += 1;
-            }
+            CssToken::Comment(c) => out.push_str(c),
+            CssToken::Raw(r)     => out.push_str(r),
         }
     }
-
     out
 }
 
-//  CSS Tokeniser─
+//  Tokeniser 
 
 #[derive(Debug, Clone)]
 enum CssToken {
-    /// A regular `selector { declarations }` rule
     Rule(String, String),
-    /// An `@keyword ... { block }` or `@keyword ...;` at-rule
     AtRule(String, String),
-    /// A CSS comment `/* ... */`
     Comment(String),
-    /// Raw text that doesn't fit the above (whitespace, etc.)
     Raw(String),
 }
 
@@ -89,305 +59,225 @@ fn tokenize_css(css: &str) -> Vec<CssToken> {
     let mut i = 0;
 
     while i < n {
-        // Skip whitespace between rules
+        // Whitespace
         if chars[i].is_whitespace() {
             let start = i;
-            while i < n && chars[i].is_whitespace() {
-                i += 1;
-            }
+            while i < n && chars[i].is_whitespace() { i += 1; }
             tokens.push(CssToken::Raw(chars[start..i].iter().collect()));
             continue;
         }
-
         // Comment
-        if i + 1 < n && chars[i] == '/' && chars[i + 1] == '*' {
-            let start = i;
+        if i + 1 < n && chars[i] == '/' && chars[i+1] == '*' {
+            let start = i; i += 2;
+            while i + 1 < n && !(chars[i] == '*' && chars[i+1] == '/') { i += 1; }
             i += 2;
-            while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2; // consume */
             tokens.push(CssToken::Comment(chars[start..i].iter().collect()));
             continue;
         }
-
         // At-rule
         if chars[i] == '@' {
             let (tok, end) = parse_at_rule(&chars, i);
-            tokens.push(tok);
-            i = end;
+            tokens.push(tok); i = end;
             continue;
         }
-
-        // Regular rule: collect selector until '{', then block until matching '}'
+        // Selector { declarations }
         let sel_start = i;
-        while i < n && chars[i] != '{' {
-            i += 1;
-        }
+        while i < n && chars[i] != '{' { i += 1; }
         if i >= n {
-            // Trailing text with no brace — emit as raw
             tokens.push(CssToken::Raw(chars[sel_start..i].iter().collect()));
             break;
         }
         let selector: String = chars[sel_start..i].iter().collect();
         i += 1; // consume '{'
-
         let decl_start = i;
         let mut depth = 1usize;
         while i < n {
-            match chars[i] {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
+            match chars[i] { '{' => depth += 1, '}' => { depth -= 1; if depth == 0 { break; } } _ => {} }
             i += 1;
         }
         let declarations: String = chars[decl_start..i].iter().collect();
         i += 1; // consume '}'
-
         tokens.push(CssToken::Rule(selector, declarations));
     }
-
     tokens
 }
 
 fn parse_at_rule(chars: &[char], start: usize) -> (CssToken, usize) {
     let n = chars.len();
-    let mut i = start + 1; // skip '@'
-
-    // keyword
-    while i < n && !chars[i].is_whitespace() && chars[i] != '{' && chars[i] != ';' {
-        i += 1;
-    }
-    let keyword: String = chars[start + 1..i].iter().collect();
-
-    // skip whitespace and prelude
-    while i < n && chars[i] != '{' && chars[i] != ';' {
-        i += 1;
-    }
-
-    if i >= n {
-        return (
-            CssToken::AtRule(keyword, chars[start..i].iter().collect()),
-            i,
-        );
-    }
-
-    if chars[i] == ';' {
-        i += 1;
-        return (
-            CssToken::AtRule(keyword, chars[start..i].iter().collect()),
-            i,
-        );
-    }
-
-    // block
-    i += 1; // consume '{'
+    let mut i = start + 1;
+    while i < n && !chars[i].is_whitespace() && chars[i] != '{' && chars[i] != ';' { i += 1; }
+    let keyword: String = chars[start+1..i].iter().collect();
+    while i < n && chars[i] != '{' && chars[i] != ';' { i += 1; }
+    if i >= n { return (CssToken::AtRule(keyword, chars[start..i].iter().collect()), i); }
+    if chars[i] == ';' { i += 1; return (CssToken::AtRule(keyword, chars[start..i].iter().collect()), i); }
+    i += 1; // '{'
     let block_start = i;
     let mut depth = 1usize;
     while i < n {
-        match chars[i] {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            _ => {}
-        }
+        match chars[i] { '{' => depth += 1, '}' => { depth -= 1; if depth == 0 { break; } } _ => {} }
         i += 1;
     }
     let block: String = chars[block_start..i].iter().collect();
-    i += 1; // consume '}'
-
+    i += 1;
     let full: String = chars[start..i].iter().collect();
     (CssToken::AtRule(keyword, full), i)
 }
 
-//  Rule Processing
+//  Rule Processing 
 
-/// Rewrite ID references in a CSS selector, e.g. `#old-id` → `#new-id`.
-fn rewrite_selector(selector: &str, id_map: &HashMap<String, Option<String>>) -> String {
-    if id_map.is_empty() || !selector.contains('#') {
-        return selector.to_string();
-    }
+fn rewrite_selector(
+    selector: &str,
+    id_map: &HashMap<String, Option<String>>,
+    vars: &[CapturedVar],
+) -> String {
+    if id_map.is_empty() || !selector.contains('#') { return selector.to_string(); }
+    // Don't rewrite if the selector contains a placeholder
+    if crate::subst::value_has_subst(selector, vars) { return selector.to_string(); }
+
     let chars: Vec<char> = selector.chars().collect();
     let n = chars.len();
     let mut out = String::with_capacity(selector.len());
     let mut i = 0;
-
     while i < n {
         if chars[i] == '#' {
-            out.push('#');
-            i += 1;
+            out.push('#'); i += 1;
             let id_start = i;
-            // Collect identifier characters
-            while i < n
-                && (chars[i].is_alphanumeric()
-                    || chars[i] == '-'
-                    || chars[i] == '_')
-            {
-                i += 1;
-            }
+            while i < n && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') { i += 1; }
             let id: String = chars[id_start..i].iter().collect();
             match id_map.get(&id) {
                 Some(Some(new_id)) => out.push_str(new_id),
-                Some(None) => out.push_str(&id), // stripped ID — keep in selector
-                None => out.push_str(&id),
+                _ => out.push_str(&id),
             }
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
+        } else { out.push(chars[i]); i += 1; }
     }
     out
 }
 
-/// Optimise the declarations block of a CSS rule.
-/// Returns the rewritten block content (without the outer braces).
-fn optimize_declarations(declarations: &str, simplify_colors: bool) -> String {
-    // Split on ';' respecting placeholder boundaries
-    let decls = split_declarations(declarations);
-    let mut out_parts: Vec<String> = Vec::new();
+fn optimize_declarations(
+    decls: &str,
+    simplify_colors: bool,
+    vars: &[CapturedVar],
+) -> String {
+    let parts = split_declarations(decls, vars);
+    let mut out: Vec<String> = Vec::new();
 
-    for decl in decls {
+    for decl in parts {
         let decl = decl.trim();
-        if decl.is_empty() {
-            continue;
-        }
-        if let Some(colon) = decl.find(':') {
-            let prop = decl[..colon].trim().to_lowercase();
-            let value = decl[colon + 1..].trim();
+        if decl.is_empty() { continue; }
+        if let Some(colon) = find_colon_outside_placeholder(decl, vars) {
+            let prop  = decl[..colon].trim().to_lowercase();
+            let value = decl[colon+1..].trim();
 
-            // Skip defaults (guard: don't strip if value contains placeholders)
-            if !value.contains(SUBST_PLACEHOLDER_MARKER) && is_default_value(&prop, value) {
+            // Leave values that contain a placeholder untouched
+            if crate::subst::value_has_subst(value, vars) {
+                out.push(format!("{}:{}", prop, value));
                 continue;
             }
-
-            // Simplify colours where applicable
-            let new_value = if simplify_colors && is_color_prop(&prop) && !value.contains(SUBST_PLACEHOLDER_MARKER) {
+            // Remove defaults
+            if is_default_value(&prop, value) { continue; }
+            // Simplify colors
+            let new_value = if simplify_colors && is_color_prop(&prop) {
                 simplify_color(value)
             } else {
                 value.to_string()
             };
-
-            out_parts.push(format!("{}:{}", prop, new_value));
+            out.push(format!("{}:{}", prop, new_value));
         } else {
-            // Unparseable — keep verbatim
-            out_parts.push(decl.to_string());
+            out.push(decl.to_string()); // unparseable — keep verbatim
         }
     }
-
-    if out_parts.is_empty() {
-        return String::new();
-    }
-
-    out_parts.join(";")
+    out.join(";")
 }
 
-fn split_declarations(s: &str) -> Vec<String> {
+fn split_declarations(s: &str, vars: &[CapturedVar]) -> Vec<String> {
+    // Split on `;` but not inside a placeholder token
     let mut parts = Vec::new();
     let mut cur = String::new();
-    let mut depth = 0usize; // track {{ }} substitution variable depth
+
+    // Collect all placeholder strings for fast scanning
+    let placeholders: Vec<&str> = vars.iter().map(|v| v.placeholder.as_str()).collect();
+
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let mut i = 0;
 
-    while i < n {
-        // Track substitution variable placeholders (null-byte delimited)
-        if chars[i] == '\x00' {
-            cur.push(chars[i]);
-            i += 1;
-            // consume until next null byte
-            while i < n && chars[i] != '\x00' {
-                cur.push(chars[i]);
-                i += 1;
+    'outer: while i < n {
+        // Check if we're at the start of a placeholder
+        for ph in &placeholders {
+            let ph_chars: Vec<char> = ph.chars().collect();
+            if chars[i..].starts_with(&ph_chars) {
+                for &c in &ph_chars { cur.push(c); }
+                i += ph_chars.len();
+                continue 'outer;
             }
-            if i < n {
-                cur.push(chars[i]); // closing \x00
-                i += 1;
-            }
-            continue;
         }
-        if chars[i] == ';' && depth == 0 {
+        if chars[i] == ';' {
             parts.push(cur.clone());
             cur.clear();
         } else {
-            if chars[i] == '(' { depth += 1; }
-            if chars[i] == ')' && depth > 0 { depth -= 1; }
             cur.push(chars[i]);
         }
         i += 1;
     }
-    if !cur.trim().is_empty() {
-        parts.push(cur);
-    }
+    if !cur.trim().is_empty() { parts.push(cur); }
     parts
 }
 
+fn find_colon_outside_placeholder(s: &str, vars: &[CapturedVar]) -> Option<usize> {
+    let placeholders: Vec<&str> = vars.iter().map(|v| v.placeholder.as_str()).collect();
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    'outer: while i < n {
+        for ph in &placeholders {
+            let ph_chars: Vec<char> = ph.chars().collect();
+            if chars[i..].starts_with(&ph_chars) {
+                i += ph_chars.len();
+                continue 'outer;
+            }
+        }
+        if chars[i] == ':' { return Some(i); }
+        i += 1;
+    }
+    None
+}
+
 fn is_color_prop(prop: &str) -> bool {
-    matches!(
-        prop,
-        "fill"
-            | "stroke"
-            | "stop-color"
-            | "flood-color"
-            | "lighting-color"
-            | "color"
-            | "background-color"
-            | "border-color"
+    matches!(prop,
+        "fill" | "stroke" | "stop-color" | "flood-color" |
+        "lighting-color" | "color" | "background-color"
     )
 }
 
-//  At-Rule Handling─
-
-fn rewrite_at_rule_block(
+fn rewrite_at_rule(
     keyword: &str,
     block: &str,
     id_map: &HashMap<String, Option<String>>,
     simplify_colors: bool,
+    vars: &[CapturedVar],
 ) -> String {
     match keyword.to_lowercase().as_str() {
+        "media" | "supports" => optimize_style_block(block, id_map, simplify_colors, vars),
         "keyframes" | "-webkit-keyframes" | "-moz-keyframes" => {
-            // Rewrite colour values inside keyframe blocks
-            rewrite_color_in_block(block, simplify_colors)
+            rewrite_color_in_block(block, simplify_colors, vars)
         }
-        "media" | "supports" => {
-            // Recursively optimise nested rules
-            optimize_style_block(block, id_map, simplify_colors)
-        }
-        _ => {
-            // @import, @font-face, @charset etc — pass through verbatim
-            block.to_string()
-        }
+        _ => block.to_string(),
     }
 }
 
-fn rewrite_color_in_block(block: &str, simplify_colors: bool) -> String {
-    if !simplify_colors {
-        return block.to_string();
-    }
-    // Simple line-by-line color rewrite for keyframe bodies
-    block
-        .lines()
-        .map(|line| {
-            if let Some(colon) = line.find(':') {
-                let prop = line[..colon].trim().to_lowercase();
-                if is_color_prop(&prop) {
-                    let value = line[colon + 1..].trim();
-                    if !value.contains(SUBST_PLACEHOLDER_MARKER) {
-                        return format!("{}:{}", prop, simplify_color(value));
-                    }
+fn rewrite_color_in_block(block: &str, simplify_colors: bool, vars: &[CapturedVar]) -> String {
+    if !simplify_colors { return block.to_string(); }
+    block.lines().map(|line| {
+        if let Some(c) = line.find(':') {
+            let prop = line[..c].trim().to_lowercase();
+            if is_color_prop(&prop) {
+                let val = line[c+1..].trim();
+                if !crate::subst::value_has_subst(val, vars) {
+                    return format!("{}:{}", prop, simplify_color(val));
                 }
             }
-            line.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        }
+        line.to_string()
+    }).collect::<Vec<_>>().join("\n")
 }

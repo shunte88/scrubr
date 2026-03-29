@@ -1,3 +1,4 @@
+mod subst;
 mod optimizer;
 mod path;
 mod css;
@@ -15,13 +16,16 @@ use clap::{Arg, ArgAction, Command};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-//use BUILD_DATE;
 
 use optimizer::{ScourOptions, optimize_svg};
 
 fn main() {
+
+    let pakage_name = env!("CARGO_PKG_NAME");
     let version = env!("CARGO_PKG_VERSION");
-    let matches = Command::new("scrubr")
+    println!("{pakage_name} v.{}", version);
+    
+    let matches = Command::new(pakage_name)
         .version(version)
         .about("The Rust SVG scrubber — optimizer/cleaner with substitution variable support")
         .arg(Arg::new("input")
@@ -36,7 +40,7 @@ fn main() {
         .arg(Arg::new("verbose")
             .short('v').long("verbose").action(ArgAction::SetTrue)
             .help("Verbose output (statistics)"))
-        // Optimization─
+        // Optimization 
         .arg(Arg::new("set-precision")
             .long("set-precision").value_name("NUM").default_value("5")
             .help("Significant digits for numeric values (default: 5)"))
@@ -67,7 +71,7 @@ fn main() {
         .arg(Arg::new("no-renderer-workaround")
             .long("no-renderer-workaround").action(ArgAction::SetTrue)
             .help("Do not work around renderer bugs"))
-        // SVG document─
+        // SVG document 
         .arg(Arg::new("strip-xml-prolog")
             .long("strip-xml-prolog").action(ArgAction::SetTrue)
             .help("Won't output the XML prolog (<?xml ?>)"))
@@ -92,7 +96,7 @@ fn main() {
         .arg(Arg::new("enable-viewboxing")
             .long("enable-viewboxing").action(ArgAction::SetTrue)
             .help("Changes document width/height to 100%/100% and creates viewBox"))
-        // Output formatting
+        // Output formatting 
         .arg(Arg::new("indent")
             .long("indent").value_name("TYPE").default_value("space")
             .help("Indentation: none, space, tab (default: space)"))
@@ -105,7 +109,7 @@ fn main() {
         .arg(Arg::new("strip-xml-space")
             .long("strip-xml-space").action(ArgAction::SetTrue)
             .help("Strip xml:space=\"preserve\" from root SVG element"))
-        // ID attributes
+        // ID attributes 
         .arg(Arg::new("enable-id-stripping")
             .long("enable-id-stripping").action(ArgAction::SetTrue)
             .help("Remove all unreferenced IDs"))
@@ -124,13 +128,13 @@ fn main() {
         .arg(Arg::new("protect-ids-prefix")
             .long("protect-ids-prefix").value_name("PREFIX")
             .help("Don't remove IDs starting with given prefix"))
-        // Compatibility
+        // Compatibility 
         .arg(Arg::new("error-on-flowtext")
             .long("error-on-flowtext").action(ArgAction::SetTrue)
             .help("Exit with error if the input SVG uses nonstandard flowing text"))
         .get_matches();
 
-    // Parse options
+    // Parse options 
 
     let precision: u8 = matches.get_one::<String>("set-precision")
         .unwrap().parse().unwrap_or(5);
@@ -186,26 +190,20 @@ fn main() {
         verbose:                  matches.get_flag("verbose"),
     };
 
-    println!("{} v.{}", 
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"), 
-        //BUILD_DATE
-    );
-
-    // Read input
+    // Read input 
 
     let input_path  = matches.get_one::<String>("input");
     let output_path = matches.get_one::<String>("output");
 
     let raw_bytes: Vec<u8> = match input_path {
         Some(p) => fs::read(p).unwrap_or_else(|e| {
-            eprintln!("scrubr: error reading '{}': {}", p, e);
+            eprintln!("{pakage_name}: error reading '{}': {}", p, e);
             std::process::exit(1);
         }),
         None => {
             let mut buf = Vec::new();
             io::stdin().read_to_end(&mut buf).unwrap_or_else(|e| {
-                eprintln!("scrubr: error reading stdin: {}", e);
+                eprintln!("{pakage_name}: error reading stdin: {}", e);
                 std::process::exit(1);
             });
             buf
@@ -230,45 +228,45 @@ fn main() {
         .map(|p| p.to_lowercase().ends_with(".svgz"))
         .unwrap_or(is_svgz_in);
 
-    // Optimize
+    // Optimize 
 
     let (optimized, stats) = optimize_svg(&svg_text, &opts);
 
-    // Flow-text handling─
+    // Flow-text handling 
 
     if stats.has_flowtext {
         if opts.error_on_flowtext {
-            eprintln!("scrubr: error: input SVG uses nonstandard flowing text (flowRoot/flowPara).");
+            eprintln!("{pakage_name}: error: input SVG uses nonstandard flowing text (flowRoot/flowPara).");
             std::process::exit(1);
         } else if !opts.quiet {
-            eprintln!("scrubr: warning: input SVG uses nonstandard flowing text (flowRoot/flowPara).");
+            eprintln!("{pakage_name}: warning: input SVG uses nonstandard flowing text (flowRoot/flowPara).");
         }
     }
 
-    // Verbose stats
+    // Verbose stats 
 
     if opts.verbose && !opts.quiet {
         let orig = svg_text.len();
         let out  = optimized.len();
         let pct  = if orig > 0 { 100.0 * (1.0 - out as f64 / orig as f64) } else { 0.0 };
-        eprintln!("scrubr: original:  {} bytes", orig);
-        eprintln!("scrubr: optimized: {} bytes", out);
-        eprintln!("scrubr: reduction: {:.2}%", pct);
+        eprintln!("{pakage_name}: original:  {} bytes", orig);
+        eprintln!("{pakage_name}: optimized: {} bytes", out);
+        eprintln!("{pakage_name}: reduction: {:.2}%", pct);
         if stats.subst_vars_preserved > 0 {
             eprintln!(
-                "scrubr: substitution variables preserved: {}",
+                "{pakage_name}: substitution variables preserved: {}",
                 stats.subst_vars_preserved
             );
         }
         if stats.gradients_deduplicated > 0 {
             eprintln!(
-                "scrubr: duplicate gradients removed: {}",
+                "{pakage_name}: duplicate gradients removed: {}",
                 stats.gradients_deduplicated
             );
         }
     }
 
-    // Write output─
+    // Write output 
 
     let out_bytes: Vec<u8> = if is_svgz_out {
         let mut enc = GzEncoder::new(Vec::new(), Compression::best());
@@ -286,13 +284,13 @@ fn main() {
                 }
             }
             fs::write(p, &out_bytes).unwrap_or_else(|e| {
-                eprintln!("scrubr: error writing '{}': {}", p, e);
+                eprintln!("{pakage_name}: error writing '{}': {}", p, e);
                 std::process::exit(1);
             });
         }
         None => {
             io::stdout().write_all(&out_bytes).unwrap_or_else(|e| {
-                eprintln!("scrubr: error writing stdout: {}", e);
+                eprintln!("{pakage_name}: error writing stdout: {}", e);
                 std::process::exit(1);
             });
         }

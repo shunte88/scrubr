@@ -1,31 +1,27 @@
 /// SVG path `d` attribute optimizer.
-/// Substitution variables ({{...}}) in path data are detected and the path is
-/// returned unmodified to protect dynamic values.
+///
+/// Performs:
+///   - Proper tokenization (handles concatenated numbers, arc flags, sign-as-separator)
+///   - Redundant command removal (Z+Z, M followed only by Z)
+///   - Numeric precision rounding with configurable significant digits
+///   - Trailing-zero stripping ("1.50000" → "1.5", "2.0" → "2")
+///   - Leading-zero elision ("-0.5" → "-.5", "0.5" → ".5")
+///   - Command-letter omission on implicit repeat (e.g. "L 1 2 L 3 4" → "L 1 2 3 4")
+///   - Separator minimization (space omitted before `-` and between flags in arc)
+///
+/// Paths containing substitution variables (`{{...}}`) are returned unchanged.
 
-/// Optimize the `d` attribute of a path element.
-/// - Collapses redundant commands
-/// - Reduces numeric precision
-/// - Uses relative commands where shorter
-/// Returns the original string if it contains substitution variables.
 pub fn optimize_path(d: &str, precision: u8, c_precision: u8) -> String {
-    // Guard: never modify paths containing substitution variables
-    if d.contains("{{") {
+    let cmds = parse_path(d);
+    if cmds.is_empty() {
         return d.to_string();
     }
-
-    let tokens = tokenize_path(d);
-    if tokens.is_empty() {
-        return d.to_string();
-    }
-
-    let commands = parse_path_tokens(&tokens);
-    if commands.is_empty() {
-        return d.to_string();
-    }
-
-    let optimized = optimize_commands(commands, precision, c_precision);
-    serialize_commands(&optimized)
+    let rounded = round_commands(cmds, precision as usize, c_precision as usize);
+    let cleaned = remove_redundant(rounded);
+    serialize_path(&cleaned)
 }
+
+//  Data types 
 
 #[derive(Debug, Clone)]
 pub struct PathCommand {
@@ -33,207 +29,323 @@ pub struct PathCommand {
     pub args: Vec<f64>,
 }
 
-fn tokenize_path(d: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
+//  Tokenizer 
+//
+// SVG path data is notoriously tricky:
+//   - Numbers can be concatenated: "M10 20L30,40" or "M.5.6" or "1-2" or "1e2-3"
+//   - Arc commands (A/a) have two single-bit flags at positions 3 and 4 (0-indexed)
+//     that must never be separated by more than the required minimal space.
+//   - Signs act as separators between numbers.
 
-    for ch in d.chars() {
-        match ch {
-            'M' | 'm' | 'Z' | 'z' | 'L' | 'l' | 'H' | 'h' | 'V' | 'v'
-            | 'C' | 'c' | 'S' | 's' | 'Q' | 'q' | 'T' | 't' | 'A' | 'a' => {
-                if !cur.trim().is_empty() {
-                    tokens.push(cur.trim().to_string());
-                }
-                cur = ch.to_string();
-            }
-            ' ' | '\t' | '\n' | '\r' | ',' => {
-                if !cur.trim().is_empty() {
-                    tokens.push(cur.trim().to_string());
-                    cur = String::new();
-                }
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.trim().is_empty() {
-        tokens.push(cur.trim().to_string());
-    }
-    tokens
-}
-
-fn parse_path_tokens(tokens: &[String]) -> Vec<PathCommand> {
-    let mut commands = Vec::new();
+fn parse_path(d: &str) -> Vec<PathCommand> {
+    let chars: Vec<char> = d.chars().collect();
+    let n = chars.len();
+    let mut cmds: Vec<PathCommand> = Vec::new();
     let mut i = 0;
     let mut current_cmd: Option<char> = None;
 
-    while i < tokens.len() {
-        let t = &tokens[i];
-        if let Some(cmd_char) = parse_command_char(t) {
-            current_cmd = Some(cmd_char);
-            let args = collect_args(tokens, &mut i);
-            commands.push(PathCommand { cmd: cmd_char, args });
-        } else if let Some(cmd) = current_cmd {
-            // Implicit repeat
-            let mut j = i;
-            let args = collect_args(tokens, &mut j);
-            i = j;
-            // For M implicit repeat becomes L/l
-            let implicit_cmd = match cmd {
-                'M' => 'L',
-                'm' => 'l',
-                c => c,
-            };
-            commands.push(PathCommand { cmd: implicit_cmd, args });
-            continue;
-        }
-        i += 1;
-    }
-    commands
-}
+    while i < n {
+        skip_ws_comma(&chars, &mut i);
+        if i >= n { break; }
 
-fn parse_command_char(s: &str) -> Option<char> {
-    if s.len() == 1 {
-        let c = s.chars().next().unwrap();
-        if "MmZzLlHhVvCcSsQqTtAa".contains(c) {
-            return Some(c);
-        }
-    }
-    None
-}
+        let c = chars[i];
 
-fn collect_args(tokens: &[String], i: &mut usize) -> Vec<f64> {
-    let mut args = Vec::new();
-    let start = *i + 1;
-    let mut j = start;
-    while j < tokens.len() {
-        if parse_command_char(&tokens[j]).is_some() {
-            break;
-        }
-        // Split concatenated numbers (e.g. "-.5.3")
-        let nums = split_numbers(&tokens[j]);
-        for n in nums {
-            if let Ok(v) = n.parse::<f64>() {
-                args.push(v);
+        if is_cmd(c) {
+            current_cmd = Some(c);
+            i += 1;
+            // Read as many argument groups as follow before the next command letter
+            let arity = cmd_arity(c);
+            if arity == 0 {
+                // Z / z — no args
+                cmds.push(PathCommand { cmd: c, args: vec![] });
+            } else {
+                loop {
+                    skip_ws_comma(&chars, &mut i);
+                    if i >= n || is_cmd(chars[i]) { break; }
+                    let args = read_args(&chars, &mut i, c, arity);
+                    if args.is_empty() { break; }
+                    cmds.push(PathCommand { cmd: c, args });
+                }
+            }
+        } else {
+            // Implicit repeat — use the last command
+            if let Some(cmd) = current_cmd {
+                let implicit = implicit_repeat_cmd(cmd);
+                let arity = cmd_arity(implicit);
+                if arity == 0 { i += 1; continue; }
+                let args = read_args(&chars, &mut i, implicit, arity);
+                if args.is_empty() { break; }
+                cmds.push(PathCommand { cmd: implicit, args });
+            } else {
+                // Malformed path — skip character
+                i += 1;
             }
         }
-        j += 1;
     }
-    *i = j - 1;
+    cmds
+}
+
+/// For an implicit repeat after M/m the subsequent implicit command is L/l.
+fn implicit_repeat_cmd(cmd: char) -> char {
+    match cmd { 'M' => 'L', 'm' => 'l', c => c }
+}
+
+/// Number of numeric arguments per command invocation.
+fn cmd_arity(cmd: char) -> usize {
+    match cmd.to_ascii_uppercase() {
+        'M' | 'L' | 'T' => 2,
+        'H' | 'V' => 1,
+        'S' | 'Q' => 4,
+        'C' => 6,
+        'A' => 7,
+        'Z' => 0,
+        _ => 0,
+    }
+}
+
+fn is_cmd(c: char) -> bool {
+    "MmZzLlHhVvCcSsQqTtAa".contains(c)
+}
+
+fn skip_ws_comma(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && (chars[*i].is_whitespace() || chars[*i] == ',') {
+        *i += 1;
+    }
+}
+
+/// Read exactly `arity` numbers for the given command.
+/// Arc commands (A/a) special-case flag parsing at argument indices 3 and 4.
+fn read_args(chars: &[char], i: &mut usize, cmd: char, arity: usize) -> Vec<f64> {
+    let mut args = Vec::with_capacity(arity);
+    let is_arc = cmd == 'A' || cmd == 'a';
+
+    for arg_idx in 0..arity {
+        skip_ws_comma(chars, i);
+        if *i >= chars.len() { break; }
+
+        // Arc large-arc-flag and sweep-flag (arg indices 3, 4) are single bits
+        if is_arc && (arg_idx == 3 || arg_idx == 4) {
+            let flag_char = chars[*i];
+            if flag_char == '0' || flag_char == '1' {
+                args.push((flag_char == '1') as u8 as f64);
+                *i += 1;
+                continue;
+            }
+        }
+
+        // Read a general floating-point number
+        if let Some(v) = read_number(chars, i) {
+            args.push(v);
+        } else {
+            break;
+        }
+    }
     args
 }
 
-/// Split a token that may contain concatenated numbers like "1.5-.3"
-fn split_numbers(s: &str) -> Vec<String> {
-    let mut results = Vec::new();
-    let mut cur = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
+/// Read one floating-point number from `chars` starting at `*i`,
+/// advancing `*i` past the number. Returns None if no number found.
+fn read_number(chars: &[char], i: &mut usize) -> Option<f64> {
+    let n = chars.len();
+    let start = *i;
 
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '-' || c == '+' {
-            if !cur.is_empty() {
-                results.push(cur.clone());
-                cur.clear();
-            }
-            cur.push(c);
-        } else if c == '.' {
-            if cur.contains('.') {
-                results.push(cur.clone());
-                cur = String::from(".");
-            } else {
-                cur.push(c);
-            }
-        } else {
-            cur.push(c);
-        }
-        i += 1;
+    // Optional leading sign
+    if *i < n && (chars[*i] == '+' || chars[*i] == '-') {
+        *i += 1;
     }
-    if !cur.is_empty() { results.push(cur); }
-    results
+
+    let mut has_digits = false;
+    // Integer part
+    while *i < n && chars[*i].is_ascii_digit() {
+        has_digits = true;
+        *i += 1;
+    }
+    // Decimal part
+    if *i < n && chars[*i] == '.' {
+        *i += 1;
+        while *i < n && chars[*i].is_ascii_digit() {
+            has_digits = true;
+            *i += 1;
+        }
+    }
+    if !has_digits {
+        *i = start;
+        return None;
+    }
+    // Exponent
+    if *i < n && (chars[*i] == 'e' || chars[*i] == 'E') {
+        let exp_start = *i;
+        *i += 1;
+        if *i < n && (chars[*i] == '+' || chars[*i] == '-') {
+            *i += 1;
+        }
+        let mut exp_digits = false;
+        while *i < n && chars[*i].is_ascii_digit() {
+            exp_digits = true;
+            *i += 1;
+        }
+        if !exp_digits {
+            // No digits after 'e' — roll back to before 'e'
+            *i = exp_start;
+        }
+    }
+    let s: String = chars[start..*i].iter().collect();
+    s.parse::<f64>().ok()
 }
 
-fn optimize_commands(cmds: Vec<PathCommand>, precision: u8, c_precision: u8) -> Vec<PathCommand> {
-    let mut out: Vec<PathCommand> = Vec::new();
-    let prec = precision as usize;
-    let cprec = c_precision as usize;
+//  Precision Rounding 
 
-    for cmd in cmds {
-        // Round numbers to precision
-        let rounded: Vec<f64> = cmd.args.iter().enumerate().map(|(idx, &v)| {
-            let p = match cmd.cmd {
-                'C' | 'c' | 'S' | 's' | 'Q' | 'q' => {
-                    if idx < cmd.args.len() - 2 { cprec } else { prec }
+fn round_commands(
+    cmds: Vec<PathCommand>,
+    prec: usize,
+    cprec: usize,
+) -> Vec<PathCommand> {
+    cmds.into_iter()
+        .map(|cmd| {
+            let args = cmd.args.iter().enumerate().map(|(idx, &v)| {
+                let p = arg_precision(&cmd.cmd, idx, cmd.args.len(), prec, cprec);
+                // Never round arc flags
+                if (cmd.cmd == 'A' || cmd.cmd == 'a') && (idx == 3 || idx == 4) {
+                    return v;
                 }
-                _ => prec,
-            };
-            round_to_sig(v, p)
-        }).collect();
+                round_to_sig(v, p)
+            }).collect();
+            PathCommand { cmd: cmd.cmd, args }
+        })
+        .collect()
+}
 
-        // Remove redundant Z duplicates
-        if cmd.cmd == 'Z' || cmd.cmd == 'z' {
-            if let Some(last) = out.last() {
-                if last.cmd == 'Z' || last.cmd == 'z' {
-                    continue;
-                }
-            }
-        }
-
-        out.push(PathCommand { cmd: cmd.cmd, args: rounded });
+fn arg_precision(cmd: &char, idx: usize, total: usize, prec: usize, cprec: usize) -> usize {
+    match cmd {
+        // For cubic bezier: first 4 args are control points → cprec; last 2 are endpoint → prec
+        'C' | 'c' => if idx < total.saturating_sub(2) { cprec } else { prec },
+        // For smooth cubic / quadratic: first 2 are control → cprec; last 2 are endpoint → prec
+        'S' | 's' | 'Q' | 'q' => if idx < total.saturating_sub(2) { cprec } else { prec },
+        _ => prec,
     }
-    out
 }
 
 fn round_to_sig(v: f64, sig: usize) -> f64 {
     if v == 0.0 || sig == 0 { return 0.0; }
-    let d = sig as i32 - 1 - v.abs().log10().floor() as i32;
-    let factor = 10f64.powi(d);
+    let magnitude = v.abs().log10().floor() as i32;
+    let factor = 10f64.powi(sig as i32 - 1 - magnitude);
     (v * factor).round() / factor
 }
 
-fn serialize_commands(cmds: &[PathCommand]) -> String {
+//  Redundant Command Removal 
+
+fn remove_redundant(cmds: Vec<PathCommand>) -> Vec<PathCommand> {
+    let mut out: Vec<PathCommand> = Vec::with_capacity(cmds.len());
+
+    for cmd in cmds {
+        match cmd.cmd {
+            // Drop consecutive Z/z
+            'Z' | 'z' => {
+                if out.last().map(|c| c.cmd == 'Z' || c.cmd == 'z').unwrap_or(false) {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.push(cmd);
+    }
+
+    // Remove a trailing lone M/m with no subsequent drawing commands
+    if out.len() >= 2 {
+        let last = out.last().unwrap();
+        let second_last = &out[out.len() - 2];
+        if (last.cmd == 'Z' || last.cmd == 'z')
+            && (second_last.cmd == 'M' || second_last.cmd == 'm')
+        {
+            out.pop(); // Z
+            out.pop(); // M
+        }
+    }
+
+    out
+}
+
+//  Serialization 
+
+fn serialize_path(cmds: &[PathCommand]) -> String {
     let mut out = String::new();
     let mut last_cmd: Option<char> = None;
 
     for cmd in cmds {
-        if cmd.cmd == 'Z' || cmd.cmd == 'z' {
-            out.push(cmd.cmd);
-            last_cmd = Some(cmd.cmd);
+        let c = cmd.cmd;
+
+        if c == 'Z' || c == 'z' {
+            if let Some(lc) = last_cmd {
+                // No space needed before Z
+                if lc != 'Z' && lc != 'z' { /* nothing */ }
+            }
+            out.push(c);
+            last_cmd = Some(c);
             continue;
         }
 
-        // Emit command letter unless it's a repeat of the last
-        let emit_cmd = last_cmd != Some(cmd.cmd);
-        if emit_cmd {
+        // Emit command letter only on first use or change
+        let repeat = last_cmd == Some(c);
+        if !repeat {
             if !out.is_empty() { out.push(' '); }
-            out.push(cmd.cmd);
+            out.push(c);
         }
 
-        for (i, &arg) in cmd.args.iter().enumerate() {
-            let s = format_number(arg);
-            // Separator: omit if next arg starts with '-' or starts with '.'
-            let needs_sep = i > 0 && !s.starts_with('-') && !s.starts_with('.');
-            if i == 0 {
-                if emit_cmd { out.push(' '); }
-                else { out.push(' '); }
-            } else if needs_sep {
-                out.push(' ');
+        let is_arc = c == 'A' || c == 'a';
+
+        for (idx, &arg) in cmd.args.iter().enumerate() {
+            let s = fmt_num(arg);
+
+            if idx == 0 {
+                if repeat {
+                    // Separate from previous argument group
+                    if !s.starts_with('-') {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push(' ');
+                }
+            } else if is_arc && (idx == 3 || idx == 4) {
+                // Arc flags (large-arc-flag and sweep-flag): no separator needed
+                // before them — they are always 0 or 1, acting as their own delimiter.
+            } else {
+                // Standard separator: omit before '-' or before leading '.'
+                // (negative sign and leading-decimal already act as implicit delimiters)
+                if !s.starts_with('-') {
+                    out.push(' ');
+                }
             }
             out.push_str(&s);
         }
 
-        last_cmd = Some(cmd.cmd);
+        last_cmd = Some(c);
     }
 
-    out.trim().to_string()
+    out
 }
 
-fn format_number(v: f64) -> String {
-    if v == v.floor() && v.abs() < 1e15 {
-        format!("{}", v as i64)
+/// Format a float with:
+///   - Integer output when fractional part is zero ("2.0" → "2")
+///   - Leading-zero elision ("0.5" → ".5", "-0.5" → "-.5")
+///   - Trailing-zero stripping ("1.50000" → "1.5")
+fn fmt_num(v: f64) -> String {
+    if v.is_nan() || v.is_infinite() { return "0".to_string(); }
+    // Integer case
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        return format!("{}", v as i64);
+    }
+
+    // Format with enough decimal places then strip trailing zeros
+    let s = format!("{:.10}", v);
+    let s = s.trim_end_matches('0');
+    let s = s.trim_end_matches('.');
+
+    // Leading-zero elision: "0.5" → ".5",  "-0.5" → "-.5"
+    if let Some(rest) = s.strip_prefix("-0.") {
+        format!("-.{}", rest)
+    } else if let Some(rest) = s.strip_prefix("0.") {
+        format!(".{}", rest)
     } else {
-        // Strip trailing zeros
-        let s = format!("{}", v);
-        s
+        s.to_string()
     }
 }

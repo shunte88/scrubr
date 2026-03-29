@@ -14,3 +14,7 @@ target
 **/mutants.out*/
 
 .vscode
+
+*copy*.*
+*Copy*.*
+
