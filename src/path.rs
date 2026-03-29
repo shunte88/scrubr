@@ -21,7 +21,7 @@ pub fn optimize_path(d: &str, precision: u8, c_precision: u8) -> String {
     serialize_path(&cleaned)
 }
 
-//  Data types 
+// ─── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PathCommand {
@@ -29,7 +29,7 @@ pub struct PathCommand {
     pub args: Vec<f64>,
 }
 
-//  Tokenizer 
+// ─── Tokenizer ────────────────────────────────────────────────────────────────
 //
 // SVG path data is notoriously tricky:
 //   - Numbers can be concatenated: "M10 20L30,40" or "M.5.6" or "1-2" or "1e2-3"
@@ -193,7 +193,7 @@ fn read_number(chars: &[char], i: &mut usize) -> Option<f64> {
     s.parse::<f64>().ok()
 }
 
-//  Precision Rounding 
+// ─── Precision Rounding ───────────────────────────────────────────────────────
 
 fn round_commands(
     cmds: Vec<PathCommand>,
@@ -232,7 +232,7 @@ fn round_to_sig(v: f64, sig: usize) -> f64 {
     (v * factor).round() / factor
 }
 
-//  Redundant Command Removal 
+// ─── Redundant Command Removal ────────────────────────────────────────────────
 
 fn remove_redundant(cmds: Vec<PathCommand>) -> Vec<PathCommand> {
     let mut out: Vec<PathCommand> = Vec::with_capacity(cmds.len());
@@ -265,7 +265,7 @@ fn remove_redundant(cmds: Vec<PathCommand>) -> Vec<PathCommand> {
     out
 }
 
-//  Serialization 
+// ─── Serialization ────────────────────────────────────────────────────────────
 
 fn serialize_path(cmds: &[PathCommand]) -> String {
     let mut out = String::new();

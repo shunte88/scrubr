@@ -9,7 +9,7 @@ use crate::color::simplify_color;
 use crate::css::is_default_value;
 use crate::subst::CapturedVar;
 
-//  Public API 
+// ─── Public API ───────────────────────────────────────────────────────────────
 
 pub fn optimize_style_block(
     css: &str,
@@ -42,7 +42,7 @@ pub fn optimize_style_block(
     out
 }
 
-//  Tokeniser 
+// ─── Tokeniser ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 enum CssToken {
@@ -123,7 +123,7 @@ fn parse_at_rule(chars: &[char], start: usize) -> (CssToken, usize) {
     (CssToken::AtRule(keyword, full), i)
 }
 
-//  Rule Processing 
+// ─── Rule Processing ──────────────────────────────────────────────────────────
 
 fn rewrite_selector(
     selector: &str,

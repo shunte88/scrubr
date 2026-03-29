@@ -25,7 +25,7 @@ const STRUCTURAL: &[&str] = &[
     "mask", "pattern", "switch", "svg", "use",
 ];
 
-//  Public Types 
+// ─── Public Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ElementFragment {
@@ -90,7 +90,7 @@ pub fn group_runs(
     out
 }
 
-//  Run Detection 
+// ─── Run Detection ────────────────────────────────────────────────────────────
 
 fn find_run(fragments: &[ElementFragment], start: usize) -> (usize, Vec<(String, String)>) {
     if start >= fragments.len() || is_structural(&fragments[start].tag) {
@@ -113,7 +113,7 @@ fn find_run(fragments: &[ElementFragment], start: usize) -> (usize, Vec<(String,
 
 fn is_structural(tag: &str) -> bool { STRUCTURAL.contains(&tag) }
 
-//  Attribute Helpers 
+// ─── Attribute Helpers ────────────────────────────────────────────────────────
 
 fn extract_groupable(attrs: &[(String, String)], vars: &[CapturedVar]) -> Vec<(String, String)> {
     attrs.iter().filter(|(k, v)| {

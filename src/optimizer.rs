@@ -26,8 +26,11 @@ use crate::subst::{
     protect_subst_vars, restore_subst_vars,
     value_has_subst, CapturedVar,
 };
+use crate::path_simplify::{
+    simplify_path_d, combine_path_d, paths_are_combinable,
+};
 
-//  Public Types 
+// ─── Public Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Indent { None, Space, Tab }
@@ -61,6 +64,8 @@ pub struct ScourOptions {
     pub protect_ids_list: Vec<String>,
     pub protect_ids_prefix: Option<String>,
     pub error_on_flowtext: bool,
+    pub simplify_paths: bool,
+    pub combine_paths: bool,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -70,9 +75,12 @@ pub struct OptimizeStats {
     pub has_flowtext: bool,
     pub subst_vars_preserved: usize,
     pub gradients_deduplicated: usize,
+    pub paths_simplified: usize,
+    pub paths_combined: usize,
+    pub empty_defs_removed: usize,
 }
 
-//  Entry Point 
+// ─── Entry Point ──────────────────────────────────────────────────────────────
 
 pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats) {
     let mut stats = OptimizeStats::default();
@@ -166,7 +174,7 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
             }
             NodeType::Element => {
                 serialize_element(
-                    &child, &mut output, opts, &id_map, &grad_dup_ids, &vars, 0,
+                    &child, &mut output, opts, &id_map, &grad_dup_ids, &vars, &mut stats, 0,
                 );
             }
             _ => {}
@@ -178,7 +186,7 @@ pub fn optimize_svg(input: &str, opts: &ScourOptions) -> (String, OptimizeStats)
     (final_output, stats)
 }
 
-//  ID / Reference / Gradient Collection 
+// ─── ID / Reference / Gradient Collection ─────────────────────────────────────
 
 fn collect_ids_and_refs(
     node: Node,
@@ -259,7 +267,7 @@ fn extract_id_refs(val: &str, referenced: &mut HashSet<String>) {
     }
 }
 
-//  Editor Namespaces 
+// ─── Editor Namespaces ────────────────────────────────────────────────────────
 
 const EDITOR_NAMESPACES: &[&str] = &[
     "http://www.inkscape.org/namespaces/inkscape",
@@ -279,7 +287,7 @@ const EDITOR_NAMESPACES: &[&str] = &[
 ];
 fn is_editor_ns(ns: &str) -> bool { EDITOR_NAMESPACES.contains(&ns) }
 
-//  Element Serialization 
+// ─── Element Serialization ────────────────────────────────────────────────────
 
 fn serialize_element(
     node: &Node,
@@ -288,6 +296,7 @@ fn serialize_element(
     id_map: &HashMap<String, Option<String>>,
     grad_dup_ids: &HashSet<String>,
     vars: &[CapturedVar],
+    stats: &mut OptimizeStats,
     depth: usize,
 ) {
     let tag   = node.tag_name();
@@ -309,12 +318,30 @@ fn serialize_element(
         }
     }
 
+    // Remove empty <defs/> — a <defs> with no visible children is useless
+    if local == "defs" && !opts.keep_unreferenced_defs {
+        let has_content = node.children().any(|c| match c.node_type() {
+            NodeType::Element => should_emit_element(&c, opts) && {
+                // check it's not itself a suppressed gradient dup
+                if matches!(c.tag_name().name(), "linearGradient" | "radialGradient" | "pattern") {
+                    c.attribute("id").map(|id| !grad_dup_ids.contains(id)).unwrap_or(true)
+                } else { true }
+            },
+            NodeType::Text => !c.text().unwrap_or("").trim().is_empty(),
+            _ => false,
+        });
+        if !has_content {
+            stats.empty_defs_removed += 1;
+            return;
+        }
+    }
+
     // Group collapsing
     if opts.group_collapsing && local == "g" && can_collapse_group(node, opts) {
         for child in node.children() {
             match child.node_type() {
                 NodeType::Element => {
-                    serialize_element(&child, out, opts, id_map, grad_dup_ids, vars, depth);
+                    serialize_element(&child, out, opts, id_map, grad_dup_ids, vars, stats, depth);
                 }
                 NodeType::Text => {
                     let t = child.text().unwrap_or("");
@@ -329,13 +356,13 @@ fn serialize_element(
         return;
     }
 
-    // Resolve id 
+    // ── Resolve id ──────────────────────────────────────────────────────
     let resolved_id = resolve_id(node, opts, id_map, vars);
 
-    // Process style="" 
+    // ── Process style="" ─────────────────────────────────────────────────
     let (style_as_xml, remaining_style) = process_style(node, opts, vars);
 
-    // Gather and merge attributes 
+    // ── Gather and merge attributes ───────────────────────────────────────
     let mut xml_attrs = gather_attrs(node, opts, id_map, vars);
     for (k, v) in &style_as_xml {
         if !xml_attrs.iter().any(|(n, _)| n == k) {
@@ -346,10 +373,24 @@ fn serialize_element(
         // Never strip an attribute that contains a placeholder
         value_has_subst(v, vars) || !is_default_value(k, v)
     });
+
+    // Path simplification stat tracking: count paths where d changed
+    if opts.simplify_paths && local == "path" {
+        for (k, v) in &mut xml_attrs {
+            if k == "d" && !value_has_subst(v, vars) {
+                let simplified = simplify_path_d(v, opts.precision);
+                if simplified != *v {
+                    stats.paths_simplified += 1;
+                    *v = simplified;
+                }
+            }
+        }
+    }
+
     xml_attrs.sort_by(|a, b| a.0.cmp(&b.0));
     apply_viewboxing(node, local, opts, &mut xml_attrs, vars);
 
-    // Serialize opening tag 
+    // ── Serialize opening tag ─────────────────────────────────────────────
     let tag_name = qualified_name(local, ns, node);
     indent(out, opts, depth);
     out.push('<');
@@ -366,7 +407,7 @@ fn serialize_element(
         write_attr(out, "style", s, opts, id_map, vars);
     }
 
-    // Children 
+    // ── Children ──────────────────────────────────────────────────────────
     let has_visible = node.children().any(|c| match c.node_type() {
         NodeType::Element => {
             if !should_emit_element(&c, opts) { return false; }
@@ -393,11 +434,11 @@ fn serialize_element(
     maybe_newline(out, opts);
 
     if local == "style" {
-        serialize_style_element(node, out, opts, id_map, vars, depth);
+        serialize_style_element(node, out, opts, id_map, grad_dup_ids, vars, stats, depth);
     } else if opts.create_groups {
-        serialize_children_with_grouping(node, out, opts, id_map, grad_dup_ids, vars, depth);
+        serialize_children_with_grouping(node, out, opts, id_map, grad_dup_ids, vars, stats, depth);
     } else {
-        serialize_children(node, out, opts, id_map, grad_dup_ids, vars, depth);
+        serialize_children(node, out, opts, id_map, grad_dup_ids, vars, stats, depth);
     }
 
     indent(out, opts, depth);
@@ -407,14 +448,16 @@ fn serialize_element(
     maybe_newline(out, opts);
 }
 
-//  <style> Element 
+// ─── <style> Element ─────────────────────────────────────────────────────────
 
 fn serialize_style_element(
     node: &Node,
     out: &mut String,
     opts: &ScourOptions,
     id_map: &HashMap<String, Option<String>>,
+    grad_dup_ids: &HashSet<String>,
     vars: &[CapturedVar],
+    stats: &mut OptimizeStats,
     depth: usize,
 ) {
     let mut css_text = String::new();
@@ -437,7 +480,7 @@ fn serialize_style_element(
     }
 }
 
-//  Child Serialization 
+// ─── Child Serialization ─────────────────────────────────────────────────────
 
 fn serialize_children(
     node: &Node,
@@ -446,12 +489,57 @@ fn serialize_children(
     id_map: &HashMap<String, Option<String>>,
     grad_dup_ids: &HashSet<String>,
     vars: &[CapturedVar],
+    stats: &mut OptimizeStats,
     depth: usize,
 ) {
-    for child in node.children() {
+    // Collect element children so we can do a combination pass
+    // Non-element nodes (text, comments) are emitted immediately and break runs.
+    let children: Vec<roxmltree::Node> = node.children().collect();
+    let n = children.len();
+    let mut skip_next = false;
+
+    for idx in 0..n {
+        if skip_next { skip_next = false; continue; }
+        let child = children[idx];
+
         match child.node_type() {
             NodeType::Element => {
-                serialize_element(&child, out, opts, id_map, grad_dup_ids, vars, depth + 1);
+                // Path combination: if this and the next sibling are both <path>
+                // elements with no id, identical presentation attrs, and no subst
+                // placeholder in their d values — merge them.
+                if opts.combine_paths
+                    && child.tag_name().name() == "path"
+                    && child.attribute("id").is_none()
+                    && idx + 1 < n
+                {
+                    let next = children[idx + 1];
+                    if next.node_type() == NodeType::Element
+                        && next.tag_name().name() == "path"
+                        && next.attribute("id").is_none()
+                    {
+                        let d1 = child.attribute("d").unwrap_or("");
+                        let d2 = next.attribute("d").unwrap_or("");
+                        let attrs1 = collect_all_attrs(&child, opts, id_map, vars);
+                        let attrs2 = collect_all_attrs(&next, opts, id_map, vars);
+                        // Compare non-d presentation attrs
+                        let attrs1_nd: Vec<_> = attrs1.iter().filter(|(k,_)| k != "d").cloned().collect();
+                        let attrs2_nd: Vec<_> = attrs2.iter().filter(|(k,_)| k != "d").cloned().collect();
+                        if crate::path_simplify::paths_are_combinable(&attrs1_nd, &attrs2_nd, vars) {
+                            if let Some(combined) = combine_path_d(d1, d2, vars) {
+                                // Emit merged path: child's attrs + combined d
+                                let mut merged_attrs = attrs1_nd.clone();
+                                merged_attrs.push(("d".to_string(), combined));
+                                emit_synthetic_path(
+                                    &merged_attrs, out, opts, id_map, vars, depth + 1,
+                                );
+                                stats.paths_combined += 1;
+                                skip_next = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                serialize_element(&child, out, opts, id_map, grad_dup_ids, vars, stats, depth + 1);
             }
             NodeType::Text => emit_text(child.text().unwrap_or(""), out, opts, depth + 1),
             NodeType::Comment => {
@@ -473,6 +561,42 @@ fn serialize_children(
     }
 }
 
+/// Emit a synthetic `<path>` element from a flat attribute list.
+/// Used when two paths have been combined into one.
+fn emit_synthetic_path(
+    attrs: &[(String, String)],
+    out: &mut String,
+    opts: &ScourOptions,
+    id_map: &HashMap<String, Option<String>>,
+    vars: &[CapturedVar],
+    depth: usize,
+) {
+    indent(out, opts, depth);
+    out.push_str("<path");
+    // Sort for determinism, d last for readability
+    let mut sorted = attrs.to_vec();
+    sorted.sort_by(|a, b| {
+        if a.0 == "d" { std::cmp::Ordering::Greater }
+        else if b.0 == "d" { std::cmp::Ordering::Less }
+        else { a.0.cmp(&b.0) }
+    });
+    for (k, v) in &sorted {
+        let v_mapped = if (opts.strip_ids || opts.shorten_ids) && v.contains('#') {
+            remap_id_refs(v, id_map)
+        } else {
+            v.clone()
+        };
+        out.push(' ');
+        out.push_str(k);
+        out.push_str("=\"");
+        out.push_str(&escape_xml_attr(&v_mapped));
+        out.push('"');
+    }
+    out.push_str("/>");
+    maybe_newline(out, opts);
+    let _ = vars;
+}
+
 fn serialize_children_with_grouping(
     node: &Node,
     out: &mut String,
@@ -480,6 +604,7 @@ fn serialize_children_with_grouping(
     id_map: &HashMap<String, Option<String>>,
     grad_dup_ids: &HashSet<String>,
     vars: &[CapturedVar],
+    stats: &mut OptimizeStats,
     depth: usize,
 ) {
     let mut fragments: Vec<ElementFragment> = Vec::new();
@@ -497,7 +622,7 @@ fn serialize_children_with_grouping(
             NodeType::Element => {
                 let all_attrs = collect_all_attrs(&child, opts, id_map, vars);
                 let mut frag_text = String::new();
-                serialize_element(&child, &mut frag_text, opts, id_map, grad_dup_ids, vars, depth + 1);
+                serialize_element(&child, &mut frag_text, opts, id_map, grad_dup_ids, vars, stats, depth + 1);
                 fragments.push(ElementFragment::new(
                     child.tag_name().name(), frag_text, &all_attrs, vars,
                 ));
@@ -540,7 +665,7 @@ fn make_indent_unit(opts: &ScourOptions) -> String {
     unit.repeat(opts.nindent as usize)
 }
 
-//  Group Collapsing 
+// ─── Group Collapsing ─────────────────────────────────────────────────────────
 
 fn can_collapse_group(node: &Node, opts: &ScourOptions) -> bool {
     if node.tag_name().name() != "g" { return false; }
@@ -564,7 +689,7 @@ fn can_collapse_group(node: &Node, opts: &ScourOptions) -> bool {
     true
 }
 
-//  ID Resolution 
+// ─── ID Resolution ────────────────────────────────────────────────────────────
 
 fn resolve_id(
     node: &Node,
@@ -586,7 +711,7 @@ fn resolve_id(
     }
 }
 
-//  Style Processing 
+// ─── Style Processing ─────────────────────────────────────────────────────────
 
 fn process_style(
     node: &Node,
@@ -614,7 +739,7 @@ fn process_style(
     (presentation_xml, remaining)
 }
 
-//  Attribute Gathering & Optimization 
+// ─── Attribute Gathering & Optimization ──────────────────────────────────────
 
 const XML_NS:   &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -695,7 +820,7 @@ fn optimize_attr(
     }
 }
 
-//  Viewboxing 
+// ─── Viewboxing ───────────────────────────────────────────────────────────────
 
 fn apply_viewboxing(
     node: &Node,
@@ -723,7 +848,7 @@ fn apply_viewboxing(
     }
 }
 
-//  Namespace Helpers 
+// ─── Namespace Helpers ────────────────────────────────────────────────────────
 
 fn find_ns_prefix(node: &Node, ns_uri: &str) -> Option<String> {
     let mut current = *node;
@@ -778,7 +903,7 @@ fn should_emit_element(node: &Node, opts: &ScourOptions) -> bool {
     }
 }
 
-//  ID Reference Remapping 
+// ─── ID Reference Remapping ───────────────────────────────────────────────────
 
 fn remap_id_refs(val: &str, id_map: &HashMap<String, Option<String>>) -> String {
     if id_map.is_empty() || !val.contains('#') { return val.to_string(); }
@@ -835,7 +960,7 @@ fn remap_href_refs(val: &str, id_map: &HashMap<String, Option<String>>) -> Strin
     out
 }
 
-//  Numeric Helpers 
+// ─── Numeric Helpers ──────────────────────────────────────────────────────────
 
 fn optimize_number(val: &str, precision: u8) -> String {
     let trimmed = val.trim();
@@ -883,7 +1008,7 @@ fn fmt_f64(v: f64) -> String {
     else { s.to_string() }
 }
 
-//  Output Helpers 
+// ─── Output Helpers ───────────────────────────────────────────────────────────
 
 fn write_attr(
     out: &mut String,

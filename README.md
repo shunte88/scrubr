@@ -21,7 +21,9 @@ The Rust SVG scrubber — an SVG optimizer/cleaner with full **substitution vari
 | **Defaults** | Remove attributes whose value equals the SVG specification default |
 | **IDs** | Strip unreferenced IDs, shorten IDs to minimal length, prefix/list/Inkscape protection |
 | **Gradients** | Deduplicate identical `<linearGradient>`, `<radialGradient>`, `<pattern>` definitions |
-| **Paths** | Optimize `d=""` path data: precision rounding, redundant command removal |
+| **Paths** | Optimize `d=""` path data: precision rounding, redundant command removal, absolute conversion, `H`/`V`/`S`/`T` expansion, collinear `L` merging (`--simplify-paths`) |
+| **Path combination** | Merge consecutive `<path>` siblings with identical presentation attributes (`--combine-paths`) |
+| **Empty defs** | Remove empty `<defs/>` elements that contain no usable content |
 | **Transforms** | Simplify `matrix(...)` to `translate/scale/rotate`, drop identities |
 | **Numbers** | Apply configurable significant-digit precision to all numeric attributes |
 | **Viewboxing** | Rewrite `width`/`height` to `100%` and add `viewBox` |
@@ -120,6 +122,8 @@ scrubr -i template.svg -o template.min.svg --indent=none
 | `--create-groups` | off | Group siblings with identical presentation attrs into `<g>` |
 | `--keep-editor-data` | off | Keep Inkscape/Illustrator/Sketch data |
 | `--keep-unreferenced-defs` | off | Keep unreferenced `<defs>` entries |
+| `--simplify-paths` | off | Simplify path data: absolute coords, expand `H`/`V`/`S`/`T`, merge collinear `L` |
+| `--combine-paths` | off | Combine consecutive `<path>` siblings with identical attributes |
 | `--renderer-workaround` | on | Apply librsvg bug workarounds |
 | `--no-renderer-workaround` | off | Disable renderer workarounds |
 
@@ -185,6 +189,8 @@ src/
 ├── css.rs          style="" parser, style→XML conversion, default detection
 ├── color.rs        Full CSS color keyword table, hex normalization, rgb()
 ├── path.rs         SVG path d="" optimizer
+├── path_simplify.rs Path simplification (absolute conversion, H/V/S/T expansion,
+│                     collinear L merge) and picosvg-style path combination
 ├── transform.rs    Transform simplifier (matrix→translate/scale/rotate)
 └── ids.rs          Short-ID generator, protection logic, rename-map builder
 ```
@@ -199,6 +205,9 @@ src/
 | Gradient deduplication | ✓ | ✓ |
 | `<style>` block CSS optimization | Basic | ✓ Full (color, defaults, IDs, @media) |
 | `--create-groups` | ✓ | ✓ |
+| Path simplification (`--simplify-paths`) | — | ✓ Absolute, H/V/S/T expand, collinear merge |
+| Path combination (`--combine-paths`) | — | ✓ picosvg-style sibling merge |
+| Empty `<defs/>` removal | ✓ | ✓ |
 | Performance | ~seconds on large files | Typically 10–100× faster |
 | SVGZ | ✓ | ✓ |
 

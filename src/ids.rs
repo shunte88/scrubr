@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-//  ID Generation 
+// ─── ID Generation ────────────────────────────────────────────────────────────
 
 /// Generate the n-th short ID in the sequence a, b, …, z, A, B, …, Z, aa, ab, …
 /// An optional prefix is prepended.
@@ -26,7 +26,7 @@ pub fn short_id(n: usize, prefix: Option<&str>) -> String {
     }
 }
 
-//  Protection Check 
+// ─── Protection Check ─────────────────────────────────────────────────────────
 
 /// Return true if this ID should never be removed or renamed.
 fn should_protect(
@@ -52,7 +52,7 @@ fn should_protect(
     false
 }
 
-//  Build Rename Map 
+// ─── Build Rename Map ─────────────────────────────────────────────────────────
 
 /// Build a map from every defined ID to its new value:
 ///   - `Some(same_id)` — keep as-is
