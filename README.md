@@ -3,7 +3,6 @@
 ![version](version.svg)
 [![Build Status](https://github.com/shunte88/scrubr/actions/workflows/rust.yml/badge.svg)](https://github.com/shunte88/scrubr/actions/workflows/rust.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-(https://www.gnu.org/licenses/apache-2.0)
 
 The Rust SVG scrubber — an SVG optimizer/cleaner with full **substitution variable support** for dynamic SVG templating systems.
 
